@@ -4,7 +4,7 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="2026.09.10-6"
+SCRIPT_VERSION="2026.09.10-7"
 REPO_RAW="${REPO_RAW:-https://raw.githubusercontent.com/norachchan/bootstrap-xui/main}"
 TEMPLATE_URL="${TEMPLATE_URL:-${REPO_RAW}/template.db}"
 XUI_INSTALL_URL="${XUI_INSTALL_URL:-https://raw.githubusercontent.com/MHSanaei/3x-ui/refs/heads/main/install.sh}"
@@ -255,19 +255,12 @@ run_xui_install() {
 
   export DEBIAN_FRONTEND=noninteractive
   export XUI_NONINTERACTIVE=1
-  # Всегда sqlite: template.db — sqlite, postgres без DSN ломает reinstall
   export XUI_DB_TYPE=sqlite
-  export XUI_SSL_MODE="$SSL_MODE"
+  # SSL ставим сами после template — иначе LE rate-limit + шум install.sh
+  export XUI_SSL_MODE=none
   unset XUI_DB_DSN XUI_USERNAME XUI_PASSWORD XUI_PANEL_PORT XUI_WEB_BASE_PATH || true
+  unset XUI_DOMAIN XUI_ACME_EMAIL || true
 
-  if [[ "$SSL_MODE" == "domain" ]]; then
-    export XUI_DOMAIN="$SSL_DOMAIN"
-    [[ -n "$SSL_EMAIL" ]] && export XUI_ACME_EMAIL="$SSL_EMAIL"
-  else
-    unset XUI_DOMAIN XUI_ACME_EMAIL || true
-  fi
-
-  # Приглушить шум apt/curl progress, оставить суть SSL/ошибок
   local logf rc
   logf=$(mktemp /tmp/xui-install-log.XXXXXX)
   set +e
@@ -275,7 +268,7 @@ run_xui_install() {
   rc=$?
   set -e
   grep -Euv \
-    '^(Hit:|Get:|Ign:|Reading package|Building dependency|Suggested packages|The following|Use '\''apt|0 upgraded|[[:space:]]*% Total|[[:space:]]*[0-9]+[[:space:]]+[0-9]|x-ui/|100[[:space:]]|No checksum|Got x-ui latest|Beginning|Arch:|The OS release|Running\.\.\.|ca-certificates is already|curl is already|tar is already|tzdata is already|socat is already|cron is already|openssl is already|libfwupd|libgusb|Created symlink|Synchronizing state|Executing:|Fail2ban is already|Ip Limit jail|IP Limit installed|Fail2ban setup complete|Setting up Fail2ban|Configuring IP Limit|Found x-ui\.service|Setting up systemd|x-ui control menu|│|└─|┌─)' \
+    '^(Hit:|Get:|Ign:|Reading package|Building dependency|Suggested packages|The following|Use '\''apt|0 upgraded|[[:space:]]*% Total|[[:space:]]*[0-9]+[[:space:]]+[0-9]|x-ui/|100[[:space:]]|No checksum|Got x-ui latest|Beginning|Arch:|The OS release|Running\.\.\.|ca-certificates is already|curl is already|tar is already|tzdata is already|socat is already|cron is already|openssl is already|libfwupd|libgusb|Created symlink|Synchronizing state|Executing:|Fail2ban is already|Ip Limit jail|IP Limit installed|Fail2ban setup complete|Setting up Fail2ban|Configuring IP Limit|Found x-ui\.service|Setting up systemd|x-ui control menu|│|└─|┌─|Username:|Password:|Port:|WebBasePath:|Access URL:|Database:|⚠|═)' \
     "$logf" || true
   rm -f "$tmp" "$logf"
   return "$rc"
@@ -290,6 +283,85 @@ install_3xui() {
   fi
   err "установка 3x-ui провалилась"
   exit 1
+}
+
+# Восстановить/выпустить TLS. При LE rate-limit — взять уже выпущенный cert из acme.sh
+ensure_tls_certs() {
+  HAS_TLS=0
+  CERT_FILE=""
+  KEY_FILE=""
+
+  if [[ "${SSL_MODE:-}" == "domain" && -n "${SSL_DOMAIN:-}" ]]; then
+    CERT_FILE="/root/cert/${SSL_DOMAIN}/fullchain.pem"
+    KEY_FILE="/root/cert/${SSL_DOMAIN}/privkey.pem"
+    if [[ -f "$CERT_FILE" && -f "$KEY_FILE" ]]; then
+      HAS_TLS=1
+      return 0
+    fi
+    # acme.sh cache
+    if [[ -f "/root/.acme.sh/${SSL_DOMAIN}_ecc/fullchain.cer" ]]; then
+      mkdir -p "/root/cert/${SSL_DOMAIN}"
+      cp -f "/root/.acme.sh/${SSL_DOMAIN}_ecc/fullchain.cer" "$CERT_FILE"
+      cp -f "/root/.acme.sh/${SSL_DOMAIN}_ecc/${SSL_DOMAIN}.key" "$KEY_FILE"
+      HAS_TLS=1
+      ok "SSL: взяли существующий cert для ${SSL_DOMAIN}"
+      return 0
+    fi
+    warn "SSL domain: файлов нет (выпуск через install пропущен) — HTTP"
+    return 0
+  fi
+
+  # IP mode (default)
+  CERT_FILE="$CERT_FULLCHAIN"
+  KEY_FILE="$CERT_PRIVKEY"
+  if [[ -f "$CERT_FILE" && -f "$KEY_FILE" ]]; then
+    HAS_TLS=1
+    ok "SSL: /root/cert/ip уже есть"
+    return 0
+  fi
+
+  local ip acme_dir
+  ip=$(public_ipv4 || true)
+  [[ -n "$ip" ]] || ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+
+  acme_dir=""
+  if [[ -n "$ip" && -d "/root/.acme.sh/${ip}_ecc" ]]; then
+    acme_dir="/root/.acme.sh/${ip}_ecc"
+  else
+    # любой IP-cert в acme.sh
+    acme_dir=$(find /root/.acme.sh -maxdepth 1 -type d -name '*_ecc' 2>/dev/null | head -1 || true)
+  fi
+
+  if [[ -n "$acme_dir" && -f "${acme_dir}/fullchain.cer" ]]; then
+    local key
+    key=$(find "$acme_dir" -maxdepth 1 -type f -name '*.key' ! -name '*.csr' | head -1 || true)
+    if [[ -n "$key" ]]; then
+      mkdir -p /root/cert/ip
+      cp -f "${acme_dir}/fullchain.cer" "$CERT_FILE"
+      cp -f "$key" "$KEY_FILE"
+      chmod 600 "$KEY_FILE"
+      HAS_TLS=1
+      ok "SSL: восстановили cert из acme.sh (без нового выпуска)"
+      return 0
+    fi
+  fi
+
+  warn "SSL: нет локального cert (LE rate-limit?) — панель на HTTP"
+  HAS_TLS=0
+}
+
+clear_cert_paths_in_db() {
+  sqlite3 "$XUI_DB_PATH" "UPDATE settings SET value='' WHERE key IN ('webCertFile','webKeyFile','subCertFile','subKeyFile');"
+}
+
+apply_cert_paths() {
+  if [[ "${HAS_TLS:-0}" -eq 1 && -f "${CERT_FILE:-}" && -f "${KEY_FILE:-}" ]]; then
+    xui_cli cert -webCert "$CERT_FILE" -webCertKey "$KEY_FILE" >/dev/null 2>&1 || true
+    sqlite3 "$XUI_DB_PATH" "UPDATE settings SET value='${CERT_FILE}' WHERE key IN ('webCertFile','subCertFile');"
+    sqlite3 "$XUI_DB_PATH" "UPDATE settings SET value='${KEY_FILE}' WHERE key IN ('webKeyFile','subKeyFile');"
+  else
+    clear_cert_paths_in_db
+  fi
 }
 
 download_template() {
@@ -335,6 +407,10 @@ restore_template_db() {
     sqlite3 "$tmp_db" "UPDATE inbounds SET tag='${INBOUND_TAG//\'/\'\'}' WHERE tag='${old_tag//\'/\'\'}';"
   fi
   sqlite3 "$tmp_db" "DELETE FROM api_tokens;"
+  # template указывает на /root/cert/ip — если файлов нет, не оставляем битые пути
+  if [[ ! -f "$CERT_FULLCHAIN" || ! -f "$CERT_PRIVKEY" ]]; then
+    sqlite3 "$tmp_db" "UPDATE settings SET value='' WHERE key IN ('webCertFile','webKeyFile','subCertFile','subKeyFile');"
+  fi
 
   install -m 600 "$tmp_db" "$XUI_DB_PATH"
   rm -f "$tmp_db"
@@ -386,27 +462,19 @@ apply_panel_credentials() {
   got_port=$(sqlite3 "$XUI_DB_PATH" "SELECT value FROM settings WHERE key='webPort';")
   [[ "$got_port" == "$PANEL_PORT" ]] || { err "webPort=${got_port}, ждали ${PANEL_PORT}"; exit 1; }
 
-  if [[ -f "$CERT_FULLCHAIN" && -f "$CERT_PRIVKEY" ]]; then
-    xui_cli cert -webCert "$CERT_FULLCHAIN" -webCertKey "$CERT_PRIVKEY" >/dev/null 2>&1 || true
-    sqlite3 "$XUI_DB_PATH" "UPDATE settings SET value='${CERT_FULLCHAIN}' WHERE key IN ('webCertFile','subCertFile');"
-    sqlite3 "$XUI_DB_PATH" "UPDATE settings SET value='${CERT_PRIVKEY}' WHERE key IN ('webKeyFile','subKeyFile');"
-  elif [[ -n "${SSL_DOMAIN:-}" && -f "/root/cert/${SSL_DOMAIN}/fullchain.pem" ]]; then
-    xui_cli cert -webCert "/root/cert/${SSL_DOMAIN}/fullchain.pem" \
-      -webCertKey "/root/cert/${SSL_DOMAIN}/privkey.pem" >/dev/null 2>&1 || true
-  fi
+  ensure_tls_certs
+  apply_cert_paths
 
   create_api_token
   [[ -n "$API_TOKEN" ]] && ok "API token создан" || warn "API token не создан"
 
-  local host scheme="https"
+  local host scheme="http"
   host=$(public_ipv4 || true)
   [[ -n "$host" ]] || host="<SERVER_IP>"
   if [[ "${SSL_MODE:-}" == "domain" && -n "${SSL_DOMAIN:-}" ]]; then
     host="$SSL_DOMAIN"
   fi
-  if [[ ! -f "$CERT_FULLCHAIN" && ! -f "/root/cert/${SSL_DOMAIN:-}/fullchain.pem" ]]; then
-    scheme="http"
-  fi
+  [[ "${HAS_TLS:-0}" -eq 1 ]] && scheme="https"
   ACCESS_URL="${scheme}://${host}:${PANEL_PORT}/${PANEL_PATH}/"
 
   install -d -m 700 /etc/x-ui
@@ -426,8 +494,11 @@ EOF
 
   open_firewall_port "$PANEL_PORT"
   start_xui
-  verify_panel_up "$PANEL_PORT" || exit 1
-  ok "панель на порту ${PANEL_PORT}"
+  if verify_panel_up "$PANEL_PORT"; then
+    ok "панель на порту ${PANEL_PORT} (${scheme})"
+  else
+    warn "порт ${PANEL_PORT} не подтвердился — смотри URL ниже и journalctl -u x-ui"
+  fi
 }
 
 print_summary() {
@@ -462,6 +533,7 @@ main() {
   INBOUND_TAG=""
   PANEL_USER="" PANEL_PASS="" PANEL_PATH="" PANEL_PORT=""
   ACCESS_URL="" API_TOKEN=""
+  HAS_TLS=0 CERT_FILE="" KEY_FILE=""
 
   apt_upgrade_noninteractive
   ask_ssl_mode
