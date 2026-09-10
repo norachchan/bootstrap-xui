@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
 # bootstrap-xui.sh — apt upgrade + 3x-ui + SSL + restore template.db
 # One-liner:
-#   bash <(curl -Ls https://raw.githubusercontent.com/norachchan/harden-server/main/bootstrap-xui.sh)
+#   bash <(curl -Ls https://raw.githubusercontent.com/norachchan/bootstrap-xui/main/bootstrap-xui.sh)
 #
 # Secrets are printed once and not written by this script (except what 3x-ui itself writes).
 
 set -euo pipefail
 
-SCRIPT_VERSION="2026.09.10-1"
+SCRIPT_VERSION="2026.09.10-2"
 
 # Override if hosting elsewhere:
-REPO_RAW="${REPO_RAW:-https://raw.githubusercontent.com/norachchan/harden-server/main}"
+REPO_RAW="${REPO_RAW:-https://raw.githubusercontent.com/norachchan/bootstrap-xui/main}"
 TEMPLATE_URL="${TEMPLATE_URL:-${REPO_RAW}/template.db}"
 XUI_INSTALL_URL="${XUI_INSTALL_URL:-https://raw.githubusercontent.com/MHSanaei/3x-ui/refs/heads/main/install.sh}"
 
