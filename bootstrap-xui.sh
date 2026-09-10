@@ -1,15 +1,10 @@
 #!/usr/bin/env bash
-# bootstrap-xui.sh — apt upgrade + 3x-ui + SSL + restore template.db
-# One-liner:
+# bootstrap-xui.sh — quick 3x-ui install + template inbounds
 #   bash <(curl -Ls https://raw.githubusercontent.com/norachchan/bootstrap-xui/main/bootstrap-xui.sh)
-#
-# Secrets are printed once and not written by this script (except what 3x-ui itself writes).
 
 set -euo pipefail
 
-SCRIPT_VERSION="2026.09.10-2"
-
-# Override if hosting elsewhere:
+SCRIPT_VERSION="2026.09.10-5"
 REPO_RAW="${REPO_RAW:-https://raw.githubusercontent.com/norachchan/bootstrap-xui/main}"
 TEMPLATE_URL="${TEMPLATE_URL:-${REPO_RAW}/template.db}"
 XUI_INSTALL_URL="${XUI_INSTALL_URL:-https://raw.githubusercontent.com/MHSanaei/3x-ui/refs/heads/main/install.sh}"
@@ -24,17 +19,31 @@ RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 CYAN='\033[0;36m'
+BLUE='\033[0;34m'
 BOLD='\033[1m'
+DIM='\033[2m'
 NC='\033[0m'
 
-log()  { echo -e "${CYAN}[INF]${NC} $*"; }
-ok()   { echo -e "${GREEN}[OK]${NC}  $*"; }
-warn() { echo -e "${YELLOW}[WARN]${NC} $*"; }
-err()  { echo -e "${RED}[ERR]${NC} $*"; }
+log()  { echo -e "  ${CYAN}›${NC} $*"; }
+ok()   { echo -e "  ${GREEN}✓${NC} $*"; }
+warn() { echo -e "  ${YELLOW}!${NC} $*"; }
+err()  { echo -e "  ${RED}✗${NC} $*" >&2; }
+
+banner() {
+  echo ""
+  echo -e "${BLUE}┌──────────────────────────────────────────────────────┐${NC}"
+  printf "${BLUE}│${NC}  ${BOLD}%-50s${NC}${BLUE}│${NC}\n" "$1"
+  echo -e "${BLUE}└──────────────────────────────────────────────────────┘${NC}"
+}
+
+step() {
+  echo ""
+  echo -e "${BOLD}$1${NC}  ${DIM}$2${NC}"
+}
 
 need_root() {
   if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
-    err "Запустите от root: sudo bash $0"
+    err "нужен root: sudo bash $0"
     exit 1
   fi
 }
@@ -47,8 +56,6 @@ gen_alnum() {
     tr -dc 'a-zA-Z0-9' </dev/urandom | head -c "$length"
   fi
 }
-
-gen_username() { gen_alnum 12; }
 
 port_in_use() {
   local port="$1"
@@ -75,27 +82,44 @@ pick_free_panel_port() {
 }
 
 public_ipv4() {
-  local ip=""
-  for url in \
-    "https://api.ipify.org" \
-    "https://ipv4.icanhazip.com" \
-    "https://ifconfig.me/ip"
-  do
+  local ip url
+  for url in https://api.ipify.org https://ipv4.icanhazip.com https://ifconfig.me/ip; do
     ip=$(curl -4 -fsS --max-time 8 "$url" 2>/dev/null | tr -d '[:space:]' || true)
-    if [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-      echo "$ip"
-      return 0
-    fi
+    [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && { echo "$ip"; return 0; }
   done
   return 1
 }
 
 ensure_sqlite3() {
-  if command -v sqlite3 >/dev/null 2>&1; then
-    return 0
+  command -v sqlite3 >/dev/null 2>&1 && return 0
+  DEBIAN_FRONTEND=noninteractive apt-get install -y -qq sqlite3 >/dev/null
+}
+
+xui_bin() {
+  if [[ -x "${XUI_FOLDER}/x-ui" ]]; then
+    echo "${XUI_FOLDER}/x-ui"
+  elif command -v x-ui >/dev/null 2>&1; then
+    command -v x-ui
+  else
+    return 1
   fi
-  log "Устанавливаю sqlite3..."
-  apt-get install -y -qq sqlite3 >/dev/null
+}
+
+# CLI setting/cert читает XUI_DB_* из shell — после postgres-install обязательно sqlite
+force_sqlite_backend() {
+  [[ -f "$XUI_ENV_FILE" ]] && cp -a "$XUI_ENV_FILE" "${XUI_ENV_FILE}.bak.$(date +%s)" 2>/dev/null || true
+  install -d -m 755 "$(dirname "$XUI_ENV_FILE")"
+  printf 'XUI_DB_TYPE=sqlite\n' >"$XUI_ENV_FILE"
+  chmod 644 "$XUI_ENV_FILE"
+  export XUI_DB_TYPE=sqlite
+  unset XUI_DB_DSN PG_USER PG_PASS PG_HOST PG_PORT PG_DB 2>/dev/null || true
+  systemctl daemon-reload 2>/dev/null || true
+}
+
+xui_cli() {
+  local bin
+  bin=$(xui_bin) || return 1
+  XUI_DB_TYPE=sqlite env -u XUI_DB_DSN "$bin" "$@"
 }
 
 stop_xui() {
@@ -106,73 +130,80 @@ stop_xui() {
   if [[ -n "${pids}" ]]; then
     # shellcheck disable=SC2086
     kill -TERM $pids 2>/dev/null || true
-    sleep 2
+    sleep 1
     pids=$(pgrep -f '^/usr/local/x-ui/x-ui( |$)' 2>/dev/null || true)
-    if [[ -n "${pids}" ]]; then
-      # shellcheck disable=SC2086
-      kill -KILL $pids 2>/dev/null || true
-    fi
+    # shellcheck disable=SC2086
+    [[ -n "${pids}" ]] && kill -KILL $pids 2>/dev/null || true
   fi
 }
 
 start_xui() {
   systemctl daemon-reload 2>/dev/null || true
   systemctl enable x-ui >/dev/null 2>&1 || true
-  systemctl restart x-ui 2>/dev/null || systemctl start x-ui 2>/dev/null || {
-    if [[ -x "${XUI_FOLDER}/x-ui" ]]; then
-      nohup "${XUI_FOLDER}/x-ui" >/var/log/x-ui-install-template.log 2>&1 &
-    fi
-  }
+  systemctl restart x-ui 2>/dev/null || systemctl start x-ui 2>/dev/null || true
   sleep 2
 }
 
-force_sqlite_backend() {
-  # template.db — SQLite; postgres backend после restore не нужен
-  if [[ -f "$XUI_ENV_FILE" ]]; then
-    cp -a "$XUI_ENV_FILE" "${XUI_ENV_FILE}.bak.$(date +%s)" 2>/dev/null || true
+open_firewall_port() {
+  local port="$1"
+  [[ -n "$port" ]] || return 0
+  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi 'Status: active'; then
+    ufw allow "${port}/tcp" >/dev/null 2>&1 || true
+    ufw allow 443/tcp >/dev/null 2>&1 || true
+  elif command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active --quiet firewalld 2>/dev/null; then
+    firewall-cmd --permanent --add-port="${port}/tcp" >/dev/null 2>&1 || true
+    firewall-cmd --permanent --add-port=443/tcp >/dev/null 2>&1 || true
+    firewall-cmd --reload >/dev/null 2>&1 || true
+  elif command -v iptables >/dev/null 2>&1; then
+    iptables -C INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null \
+      || iptables -I INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null || true
+    iptables -C INPUT -p tcp --dport 443 -j ACCEPT 2>/dev/null \
+      || iptables -I INPUT -p tcp --dport 443 -j ACCEPT 2>/dev/null || true
   fi
-  install -d -m 755 "$(dirname "$XUI_ENV_FILE")"
-  cat >"$XUI_ENV_FILE" <<'EOF'
-XUI_DB_TYPE=sqlite
-EOF
-  chmod 644 "$XUI_ENV_FILE"
-  # На всякий случай убрать postgres DSN из окружения сервиса
-  if [[ -f /etc/systemd/system/x-ui.service ]]; then
-    systemctl daemon-reload 2>/dev/null || true
-  fi
-  ok "Backend панели: SQLite (${XUI_DB_PATH})"
 }
 
+verify_panel_up() {
+  local port="$1" i
+  for i in $(seq 1 12); do
+    if systemctl is-active --quiet x-ui 2>/dev/null && port_in_use "$port"; then
+      return 0
+    fi
+    sleep 1
+  done
+  err "панель не слушает порт ${port}"
+  systemctl status x-ui --no-pager -l 2>&1 | tail -20 || true
+  journalctl -u x-ui -n 30 --no-pager 2>&1 || true
+  return 1
+}
+
+# ── steps ──────────────────────────────────────────────────────────────────
+
 apt_upgrade_noninteractive() {
-  log "apt update/upgrade (noninteractive, keep local configs)..."
+  step "1/5" "обновление пакетов"
   export DEBIAN_FRONTEND=noninteractive
-  apt-get update -y
-  apt-get -y \
+  apt-get update -qq
+  apt-get -y -qq \
     -o Dpkg::Options::="--force-confdef" \
     -o Dpkg::Options::="--force-confold" \
-    upgrade
+    upgrade >/dev/null
   apt-get install -y -qq curl ca-certificates sqlite3 openssl >/dev/null
-  ok "Пакеты обновлены"
+  ok "готово"
 }
 
 ask_ssl_mode() {
+  step "2/5" "SSL"
   echo ""
-  echo -e "${BOLD}SSL Certificate Setup${NC}"
-  echo "  1) Let's Encrypt for Domain (90-day)"
-  echo "  2) Let's Encrypt for IP Address (6-day, default)"
+  echo -e "  ${BOLD}1${NC}  Domain  ${DIM}(Let's Encrypt, 90 дней)${NC}"
+  echo -e "  ${BOLD}2${NC}  IP      ${DIM}(Let's Encrypt, ~6 дней, по умолчанию)${NC}"
   echo ""
   local choice=""
-  read -rp "Choose an option (default 2 for IP): " choice || true
+  read -rp "  Выбор [2]: " choice || true
   choice="${choice// /}"
   case "$choice" in
-    1)
-      SSL_MODE="domain"
-      ;;
-    ""|2)
-      SSL_MODE="ip"
-      ;;
+    1) SSL_MODE="domain" ;;
+    ""|2) SSL_MODE="ip" ;;
     *)
-      warn "Неизвестный выбор '${choice}' — использую IP (2)"
+      warn "неизвестно — IP"
       SSL_MODE="ip"
       ;;
   esac
@@ -181,43 +212,38 @@ ask_ssl_mode() {
   SSL_EMAIL=""
   if [[ "$SSL_MODE" == "domain" ]]; then
     while [[ -z "$SSL_DOMAIN" ]]; do
-      read -rp "Domain name: " SSL_DOMAIN || true
+      read -rp "  Domain: " SSL_DOMAIN || true
       SSL_DOMAIN="${SSL_DOMAIN// /}"
     done
-    read -rp "ACME email (optional, Enter to skip): " SSL_EMAIL || true
+    read -rp "  Email (Enter — пропуск): " SSL_EMAIL || true
     SSL_EMAIL="${SSL_EMAIL// /}"
   fi
-  ok "SSL mode: ${SSL_MODE}${SSL_DOMAIN:+ (${SSL_DOMAIN})}"
+  ok "SSL: ${SSL_MODE}${SSL_DOMAIN:+ → ${SSL_DOMAIN}}"
 }
 
 ask_inbound_tag() {
-  local default_tag="$1"
+  local default_tag="$1" tag=""
   echo ""
-  echo -e "${BOLD}Inbound tag${NC}"
-  echo "Текущий tag в template: ${default_tag}"
-  local tag=""
+  echo -e "  Template tag: ${DIM}${default_tag}${NC}"
   while true; do
-    read -rp "Новый inbound tag: " tag || true
+    read -rp "  Новый inbound tag: " tag || true
     tag="${tag// /}"
     if [[ -z "$tag" ]]; then
-      err "Tag не может быть пустым"
+      err "пустой tag"
       continue
     fi
     if [[ ! "$tag" =~ ^[A-Za-z0-9._:-]+$ ]]; then
-      err "Допустимы: буквы, цифры, . _ : -"
+      err "только A-Za-z0-9 . _ : -"
       continue
     fi
     INBOUND_TAG="$tag"
     break
   done
-  ok "Inbound tag: ${INBOUND_TAG}"
 }
 
 run_xui_install() {
-  local db_type="$1" # postgres|sqlite
-  local tmp
+  local db_type="$1" tmp
   tmp=$(mktemp /tmp/xui-install.XXXXXX.sh)
-  log "Скачиваю официальный install.sh..."
   curl -fsSL "$XUI_INSTALL_URL" -o "$tmp"
   chmod +x "$tmp"
 
@@ -225,7 +251,7 @@ run_xui_install() {
   export XUI_NONINTERACTIVE=1
   export XUI_DB_TYPE="$db_type"
   export XUI_SSL_MODE="$SSL_MODE"
-  unset XUI_DB_DSN || true
+  unset XUI_DB_DSN XUI_USERNAME XUI_PASSWORD XUI_PANEL_PORT XUI_WEB_BASE_PATH || true
 
   if [[ "$SSL_MODE" == "domain" ]]; then
     export XUI_DOMAIN="$SSL_DOMAIN"
@@ -234,10 +260,6 @@ run_xui_install() {
     unset XUI_DOMAIN XUI_ACME_EMAIL || true
   fi
 
-  # Не пиним credentials на этапе install — перезапишем после template
-  unset XUI_USERNAME XUI_PASSWORD XUI_PANEL_PORT XUI_WEB_BASE_PATH || true
-
-  log "Запуск 3x-ui install (DB=${db_type}, SSL=${SSL_MODE})..."
   set +e
   bash "$tmp"
   local rc=$?
@@ -247,152 +269,140 @@ run_xui_install() {
 }
 
 install_3xui_with_db_fallback() {
-  if [[ -x "${XUI_FOLDER}/x-ui" ]] || systemctl cat x-ui.service >/dev/null 2>&1; then
-    warn "3x-ui уже установлен — пропускаю download/install, продолжаю SSL/template при необходимости"
-    # Если бинарь есть, но SSL/конфиг могли быть не доделаны — всё равно пробуем свежий install
-    # (официальный скрипт идемпотентен для existing install).
-  fi
-
-  log "Пробую PostgreSQL..."
+  step "3/5" "установка 3x-ui"
+  log "PostgreSQL…"
   if run_xui_install postgres; then
     DB_BACKEND="postgres"
-    ok "3x-ui установлен с PostgreSQL"
+    ok "установлено (postgres)"
     return 0
   fi
-
-  warn "PostgreSQL install failed — fallback на SQLite"
+  warn "postgres не вышел — SQLite"
   if run_xui_install sqlite; then
     DB_BACKEND="sqlite"
-    ok "3x-ui установлен с SQLite"
+    ok "установлено (sqlite)"
     return 0
   fi
-
-  err "Установка 3x-ui не удалась (postgres и sqlite)"
+  err "установка 3x-ui провалилась"
   exit 1
 }
 
 download_template() {
-  local dest="$1"
-  # Локальный файл рядом со скриптом (не при bash <(curl ...))
-  local self_dir=""
+  local dest="$1" self_dir=""
   if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
     self_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
   fi
   if [[ -n "$self_dir" && -f "${self_dir}/template.db" ]]; then
-    log "Беру ${self_dir}/template.db"
     cp -f "${self_dir}/template.db" "$dest"
-    return 0
-  fi
-  if [[ -f "./template.db" ]]; then
-    log "Беру локальный ./template.db"
+  elif [[ -f "./template.db" ]]; then
     cp -f ./template.db "$dest"
-    return 0
+  else
+    curl -fsSL "$TEMPLATE_URL" -o "$dest"
   fi
-  log "Скачиваю template.db: ${TEMPLATE_URL}"
-  curl -fsSL "$TEMPLATE_URL" -o "$dest"
 }
 
 restore_template_db() {
+  step "4/5" "template + inbound"
   ensure_sqlite3
   stop_xui
   force_sqlite_backend
 
   install -d -m 700 /etc/x-ui
-  if [[ -f "$XUI_DB_PATH" ]]; then
-    cp -a "$XUI_DB_PATH" "${XUI_DB_PATH}.bak.$(date +%s)"
-  fi
-  # Убрать WAL/SHM от старой БД
+  [[ -f "$XUI_DB_PATH" ]] && cp -a "$XUI_DB_PATH" "${XUI_DB_PATH}.bak.$(date +%s)"
   rm -f "${XUI_DB_PATH}-wal" "${XUI_DB_PATH}-shm" 2>/dev/null || true
 
-  local tmp_db
+  local tmp_db old_tag
   tmp_db=$(mktemp /tmp/template.XXXXXX.db)
   download_template "$tmp_db"
 
-  # Проверка что это sqlite
   if ! sqlite3 "$tmp_db" "SELECT tag FROM inbounds LIMIT 1;" >/dev/null 2>&1; then
-    err "template.db повреждён или не SQLite"
+    err "template.db битый"
     rm -f "$tmp_db"
     exit 1
   fi
 
-  local old_tag
   old_tag=$(sqlite3 "$tmp_db" "SELECT tag FROM inbounds ORDER BY id LIMIT 1;")
-  [[ -n "$old_tag" ]] || { err "В template нет inbound"; rm -f "$tmp_db"; exit 1; }
+  [[ -n "$old_tag" ]] || { err "в template нет inbound"; rm -f "$tmp_db"; exit 1; }
 
   ask_inbound_tag "$old_tag"
 
   if [[ "$INBOUND_TAG" != "$old_tag" ]]; then
-    log "Меняю tag: ${old_tag} → ${INBOUND_TAG}"
     sqlite3 "$tmp_db" "UPDATE inbounds SET tag='${INBOUND_TAG//\'/\'\'}' WHERE tag='${old_tag//\'/\'\'}';"
-    # На случай упоминаний в JSON settings таблиц — точечная замена в outbound_traffics не нужна
   fi
-
-  # Сбросить чужие panel credentials в users — CLI перезапишет, но на всякий случай
-  # Оставляем строку users: CLI setting обновит username/password hash
+  sqlite3 "$tmp_db" "DELETE FROM api_tokens;"
 
   install -m 600 "$tmp_db" "$XUI_DB_PATH"
   rm -f "$tmp_db"
   chown root:root "$XUI_DB_PATH" 2>/dev/null || true
-  ok "template.db восстановлен → ${XUI_DB_PATH}"
+  ok "tag: ${INBOUND_TAG}"
+}
+
+create_api_token() {
+  API_TOKEN=""
+  local out
+  out=$(xui_cli setting -getApiToken -tokenName bootstrap 2>&1) || true
+  API_TOKEN=$(printf '%s\n' "$out" | grep -Eo 'apiToken: .+' | head -1 | awk '{print $2}' | tr -d '[:space:]' || true)
+  if [[ -z "$API_TOKEN" ]]; then
+    out=$(xui_cli setting -getApiToken 2>&1) || true
+    API_TOKEN=$(printf '%s\n' "$out" | grep -Eo 'apiToken: .+' | head -1 | awk '{print $2}' | tr -d '[:space:]' || true)
+  fi
 }
 
 apply_panel_credentials() {
-  local bin="${XUI_FOLDER}/x-ui"
-  [[ -x "$bin" ]] || bin=$(command -v x-ui || true)
-  [[ -n "$bin" && -x "$bin" ]] || { err "Бинарник x-ui не найден"; exit 1; }
+  step "5/5" "credentials + API token"
+  xui_bin >/dev/null || { err "x-ui не найден"; exit 1; }
 
-  PANEL_USER=$(gen_username)
+  force_sqlite_backend
+  PANEL_USER=$(gen_alnum 12)
   PANEL_PASS=$(gen_alnum 60)
   PANEL_PATH=$(gen_alnum 18)
   PANEL_PORT=$(pick_free_panel_port) || PANEL_PORT=$(shuf -i 20000-60000 -n 1)
 
   stop_xui
 
-  log "Применяю credentials / port / webBasePath..."
-  local out
-  set +e
-  out=$("$bin" setting \
+  if ! xui_cli setting \
     -username "$PANEL_USER" \
     -password "$PANEL_PASS" \
     -port "$PANEL_PORT" \
     -webBasePath "$PANEL_PATH" \
-    -resetTwoFactor=true 2>&1)
-  local rc=$?
-  set -e
-  if [[ $rc -ne 0 ]]; then
-    # Старые сборки без resetTwoFactor
-    out=$("$bin" setting \
+    -resetTwoFactor=true >/dev/null 2>&1
+  then
+    xui_cli setting \
       -username "$PANEL_USER" \
       -password "$PANEL_PASS" \
       -port "$PANEL_PORT" \
-      -webBasePath "$PANEL_PATH" 2>&1) || {
-      err "Не удалось применить setting: $out"
-      exit 1
-    }
+      -webBasePath "$PANEL_PATH" >/dev/null 2>&1 \
+      || { err "не удалось применить setting"; exit 1; }
   fi
 
-  # Вернуть SSL paths если cert уже выпущен (template мог содержать чужие/те же пути)
+  sqlite3 "$XUI_DB_PATH" "UPDATE settings SET value='${PANEL_PORT}' WHERE key='webPort';"
+  sqlite3 "$XUI_DB_PATH" "UPDATE settings SET value='/${PANEL_PATH}/' WHERE key='webBasePath';"
+  local got_port
+  got_port=$(sqlite3 "$XUI_DB_PATH" "SELECT value FROM settings WHERE key='webPort';")
+  [[ "$got_port" == "$PANEL_PORT" ]] || { err "webPort=${got_port}, ждали ${PANEL_PORT}"; exit 1; }
+
   if [[ -f "$CERT_FULLCHAIN" && -f "$CERT_PRIVKEY" ]]; then
-    log "Прописываю SSL cert paths..."
-    "$bin" cert -webCert "$CERT_FULLCHAIN" -webCertKey "$CERT_PRIVKEY" >/dev/null 2>&1 || true
-  elif [[ -f "/root/cert/${SSL_DOMAIN:-}/fullchain.pem" && -f "/root/cert/${SSL_DOMAIN:-}/privkey.pem" ]]; then
-    "$bin" cert -webCert "/root/cert/${SSL_DOMAIN}/fullchain.pem" \
+    xui_cli cert -webCert "$CERT_FULLCHAIN" -webCertKey "$CERT_PRIVKEY" >/dev/null 2>&1 || true
+    sqlite3 "$XUI_DB_PATH" "UPDATE settings SET value='${CERT_FULLCHAIN}' WHERE key IN ('webCertFile','subCertFile');"
+    sqlite3 "$XUI_DB_PATH" "UPDATE settings SET value='${CERT_PRIVKEY}' WHERE key IN ('webKeyFile','subKeyFile');"
+  elif [[ -n "${SSL_DOMAIN:-}" && -f "/root/cert/${SSL_DOMAIN}/fullchain.pem" ]]; then
+    xui_cli cert -webCert "/root/cert/${SSL_DOMAIN}/fullchain.pem" \
       -webCertKey "/root/cert/${SSL_DOMAIN}/privkey.pem" >/dev/null 2>&1 || true
   fi
 
-  # Обновить install-result.env (опционально, удобно)
+  create_api_token
+  [[ -n "$API_TOKEN" ]] && ok "API token создан" || warn "API token не создан"
+
   local host scheme="https"
   host=$(public_ipv4 || true)
   [[ -n "$host" ]] || host="<SERVER_IP>"
-  if [[ "$SSL_MODE" == "domain" && -n "${SSL_DOMAIN:-}" ]]; then
+  if [[ "${SSL_MODE:-}" == "domain" && -n "${SSL_DOMAIN:-}" ]]; then
     host="$SSL_DOMAIN"
   fi
-  # Если cert нет — всё равно https URL как после LE; иначе http
   if [[ ! -f "$CERT_FULLCHAIN" && ! -f "/root/cert/${SSL_DOMAIN:-}/fullchain.pem" ]]; then
     scheme="http"
   fi
-
   ACCESS_URL="${scheme}://${host}:${PANEL_PORT}/${PANEL_PATH}/"
+
   install -d -m 700 /etc/x-ui
   umask 077
   cat >/etc/x-ui/install-result.env <<EOF
@@ -401,45 +411,51 @@ XUI_PASSWORD=$(printf '%q' "$PANEL_PASS")
 XUI_PANEL_PORT=$(printf '%q' "$PANEL_PORT")
 XUI_WEB_BASE_PATH=$(printf '%q' "$PANEL_PATH")
 XUI_ACCESS_URL=$(printf '%q' "$ACCESS_URL")
+XUI_API_TOKEN=$(printf '%q' "${API_TOKEN:-}")
 XUI_DB_TYPE=sqlite
 XUI_INBOUND_TAG=$(printf '%q' "$INBOUND_TAG")
 EOF
   chmod 600 /etc/x-ui/install-result.env
   umask 022
 
+  open_firewall_port "$PANEL_PORT"
   start_xui
-  ok "Credentials применены"
+  verify_panel_up "$PANEL_PORT" || exit 1
+  ok "панель на порту ${PANEL_PORT}"
 }
 
 print_summary() {
+  local line
+  line() { printf "  ${DIM}%-12s${NC} %s\n" "$1" "$2"; }
+
   echo ""
-  echo -e "${BOLD}═══════════════════════════════════════════${NC}"
-  echo -e "${BOLD}  3x-ui + template — готово${NC}"
-  echo -e "${BOLD}═══════════════════════════════════════════${NC}"
-  echo -e "Access URL:    ${GREEN}${ACCESS_URL}${NC}"
-  echo -e "Username:      ${GREEN}${PANEL_USER}${NC}"
-  echo -e "Password:      ${GREEN}${PANEL_PASS}${NC}"
-  echo -e "Inbound tag:   ${GREEN}${INBOUND_TAG}${NC}"
-  echo -e "DB backend:    sqlite (template)"
-  echo -e "Install DB try: ${DB_BACKEND:-unknown}"
-  echo -e "${YELLOW}Скопируйте пароль сейчас — повторно скрипт его не покажет.${NC}"
-  echo -e "${BOLD}═══════════════════════════════════════════${NC}"
+  echo -e "${GREEN}┌──────────────────────────────────────────────────────┐${NC}"
+  echo -e "${GREEN}│${NC}  ${BOLD}Готово — скопируйте сейчас${NC}                          ${GREEN}│${NC}"
+  echo -e "${GREEN}└──────────────────────────────────────────────────────┘${NC}"
+  echo ""
+  line "URL"      "${GREEN}${ACCESS_URL}${NC}"
+  line "Username" "${GREEN}${PANEL_USER}${NC}"
+  line "Password" "${GREEN}${PANEL_PASS}${NC}"
+  if [[ -n "${API_TOKEN:-}" ]]; then
+    line "API Token" "${GREEN}${API_TOKEN}${NC}"
+  fi
+  line "Inbound"  "${GREEN}${INBOUND_TAG}${NC}"
+  echo ""
+  echo -e "  ${DIM}Bearer: Authorization: Bearer <API Token>${NC}"
+  echo -e "  ${YELLOW}Пароль и token больше не покажутся.${NC}"
+  echo ""
 }
 
 main() {
   need_root
-  echo -e "${BOLD}bootstrap-xui.sh ${SCRIPT_VERSION}${NC}"
+  clear 2>/dev/null || true
+  banner "bootstrap-xui  ${SCRIPT_VERSION}"
+  echo -e "  ${DIM}3x-ui + SSL + template inbounds${NC}"
 
-  SSL_MODE=""
-  SSL_DOMAIN=""
-  SSL_EMAIL=""
-  INBOUND_TAG=""
-  DB_BACKEND=""
-  PANEL_USER=""
-  PANEL_PASS=""
-  PANEL_PATH=""
-  PANEL_PORT=""
-  ACCESS_URL=""
+  SSL_MODE="" SSL_DOMAIN="" SSL_EMAIL=""
+  INBOUND_TAG="" DB_BACKEND=""
+  PANEL_USER="" PANEL_PASS="" PANEL_PATH="" PANEL_PORT=""
+  ACCESS_URL="" API_TOKEN=""
 
   apt_upgrade_noninteractive
   ask_ssl_mode
