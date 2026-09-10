@@ -4,7 +4,7 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="2026.09.10-11"
+SCRIPT_VERSION="2026.09.10-12"
 REPO_RAW="${REPO_RAW:-https://raw.githubusercontent.com/norachchan/bootstrap-xui/main}"
 TEMPLATE_URL="${TEMPLATE_URL:-${REPO_RAW}/template.db}"
 XUI_INSTALL_URL="${XUI_INSTALL_URL:-https://raw.githubusercontent.com/MHSanaei/3x-ui/refs/heads/main/install.sh}"
@@ -313,32 +313,64 @@ ensure_tls_certs() {
   CERT_FILE=""
   KEY_FILE=""
 
+  _cert_ok() { [[ -f "$1" && -s "$1" && -f "$2" && -s "$2" ]]; }
+
+  _install_from_acme_dir() {
+    local acme_dir="$1" dest_cert="$2" dest_key="$3"
+    local fullchain key
+    fullchain=""
+    for f in fullchain.cer fullchain.pem; do
+      [[ -s "${acme_dir}/${f}" ]] && { fullchain="${acme_dir}/${f}"; break; }
+    done
+    key=$(find "$acme_dir" -maxdepth 1 -type f \( -name '*.key' -o -name 'privkey.pem' \) ! -name '*.csr' 2>/dev/null | head -1 || true)
+    [[ -n "$fullchain" && -n "$key" && -s "$key" ]] || return 1
+    mkdir -p "$(dirname "$dest_cert")"
+    cp -f "$fullchain" "$dest_cert"
+    cp -f "$key" "$dest_key"
+    chmod 600 "$dest_key"
+    return 0
+  }
+
+  _acme_install_cert() {
+    local domain="$1" dest_cert="$2" dest_key="$3" ecc_flag="${4:-}"
+    local acme=~/.acme.sh/acme.sh
+    [[ -x "$acme" ]] || acme=/root/.acme.sh/acme.sh
+    [[ -x "$acme" ]] || return 1
+    mkdir -p "$(dirname "$dest_cert")"
+    # shellcheck disable=SC2086
+    "$acme" --install-cert -d "$domain" $ecc_flag \
+      --fullchain-file "$dest_cert" \
+      --key-file "$dest_key" \
+      --reloadcmd "systemctl restart x-ui 2>/dev/null || true" >/dev/null 2>&1
+    _cert_ok "$dest_cert" "$dest_key"
+  }
+
   if [[ "${SSL_MODE:-}" == "domain" && -n "${SSL_DOMAIN:-}" ]]; then
     CERT_FILE="/root/cert/${SSL_DOMAIN}/fullchain.pem"
     KEY_FILE="/root/cert/${SSL_DOMAIN}/privkey.pem"
-    if [[ -f "$CERT_FILE" && -f "$KEY_FILE" ]]; then
+    if _cert_ok "$CERT_FILE" "$KEY_FILE"; then
       HAS_TLS=1
+      ok "SSL: domain cert на месте"
       return 0
     fi
-    # acme.sh cache
-    if [[ -f "/root/.acme.sh/${SSL_DOMAIN}_ecc/fullchain.cer" ]]; then
-      mkdir -p "/root/cert/${SSL_DOMAIN}"
-      cp -f "/root/.acme.sh/${SSL_DOMAIN}_ecc/fullchain.cer" "$CERT_FILE"
-      cp -f "/root/.acme.sh/${SSL_DOMAIN}_ecc/${SSL_DOMAIN}.key" "$KEY_FILE"
+    if _install_from_acme_dir "/root/.acme.sh/${SSL_DOMAIN}_ecc" "$CERT_FILE" "$KEY_FILE" \
+      || _install_from_acme_dir "/root/.acme.sh/${SSL_DOMAIN}" "$CERT_FILE" "$KEY_FILE" \
+      || _acme_install_cert "$SSL_DOMAIN" "$CERT_FILE" "$KEY_FILE" "--ecc" \
+      || _acme_install_cert "$SSL_DOMAIN" "$CERT_FILE" "$KEY_FILE" ""; then
       HAS_TLS=1
-      ok "SSL: взяли существующий cert для ${SSL_DOMAIN}"
+      ok "SSL: domain cert восстановлен"
       return 0
     fi
-    warn "SSL domain: файлов нет (выпуск через install пропущен) — HTTP"
+    warn "SSL domain: cert не найден — HTTP"
     return 0
   fi
 
   # IP mode (default)
   CERT_FILE="$CERT_FULLCHAIN"
   KEY_FILE="$CERT_PRIVKEY"
-  if [[ -f "$CERT_FILE" && -f "$KEY_FILE" ]]; then
+  if _cert_ok "$CERT_FILE" "$KEY_FILE"; then
     HAS_TLS=1
-    ok "SSL: /root/cert/ip уже есть"
+    ok "SSL: /root/cert/ip на месте"
     return 0
   fi
 
@@ -346,29 +378,31 @@ ensure_tls_certs() {
   ip=$(public_ipv4 || true)
   [[ -n "$ip" ]] || ip=$(hostname -I 2>/dev/null | awk '{print $1}')
 
-  acme_dir=""
-  if [[ -n "$ip" && -d "/root/.acme.sh/${ip}_ecc" ]]; then
-    acme_dir="/root/.acme.sh/${ip}_ecc"
-  else
-    # любой IP-cert в acme.sh
-    acme_dir=$(find /root/.acme.sh -maxdepth 1 -type d -name '*_ecc' 2>/dev/null | head -1 || true)
-  fi
-
-  if [[ -n "$acme_dir" && -f "${acme_dir}/fullchain.cer" ]]; then
-    local key
-    key=$(find "$acme_dir" -maxdepth 1 -type f -name '*.key' ! -name '*.csr' | head -1 || true)
-    if [[ -n "$key" ]]; then
-      mkdir -p /root/cert/ip
-      cp -f "${acme_dir}/fullchain.cer" "$CERT_FILE"
-      cp -f "$key" "$KEY_FILE"
-      chmod 600 "$KEY_FILE"
+  # 1) acme.sh --install-cert для IP (если ордер уже есть — без нового выпуска)
+  if [[ -n "$ip" ]]; then
+    if _acme_install_cert "$ip" "$CERT_FILE" "$KEY_FILE" "--ecc" \
+      || _acme_install_cert "$ip" "$CERT_FILE" "$KEY_FILE" ""; then
       HAS_TLS=1
-      ok "SSL: восстановили cert из acme.sh (без нового выпуска)"
+      ok "SSL: IP cert через acme.sh --install-cert"
       return 0
     fi
   fi
 
-  warn "SSL: нет локального cert (LE rate-limit?) — панель на HTTP"
+  # 2) копирование из каталога acme.sh
+  for acme_dir in \
+    ${ip:+/root/.acme.sh/${ip}_ecc} \
+    ${ip:+/root/.acme.sh/${ip}} \
+    /root/.acme.sh/*_ecc
+  do
+    [[ -d "$acme_dir" ]] || continue
+    if _install_from_acme_dir "$acme_dir" "$CERT_FILE" "$KEY_FILE"; then
+      HAS_TLS=1
+      ok "SSL: восстановили из ${acme_dir##*/}"
+      return 0
+    fi
+  done
+
+  warn "SSL: cert нет (LE rate-limit?) — панель на HTTP"
   HAS_TLS=0
 }
 
@@ -377,12 +411,14 @@ clear_cert_paths_in_db() {
 }
 
 apply_cert_paths() {
-  if [[ "${HAS_TLS:-0}" -eq 1 && -f "${CERT_FILE:-}" && -f "${KEY_FILE:-}" ]]; then
+  if [[ "${HAS_TLS:-0}" -eq 1 && -f "${CERT_FILE:-}" && -s "${CERT_FILE}" && -f "${KEY_FILE:-}" && -s "${KEY_FILE}" ]]; then
     xui_cli cert -webCert "$CERT_FILE" -webCertKey "$KEY_FILE" >/dev/null 2>&1 || true
     sqlite3 "$XUI_DB_PATH" "UPDATE settings SET value='${CERT_FILE}' WHERE key IN ('webCertFile','subCertFile');"
     sqlite3 "$XUI_DB_PATH" "UPDATE settings SET value='${KEY_FILE}' WHERE key IN ('webKeyFile','subKeyFile');"
+    ok "TLS включён для panel + subscription"
   else
     clear_cert_paths_in_db
+    warn "TLS не настроен — будет предупреждение HTTP в панели"
   fi
 }
 
