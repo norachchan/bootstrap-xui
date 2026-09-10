@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # bootstrap-xui.sh — quick 3x-ui install + template inbounds
-#   bash <(curl -Ls https://raw.githubusercontent.com/norachchan/bootstrap-xui/main/bootstrap-xui.sh)
+#   bash <(curl -Ls "https://raw.githubusercontent.com/norachchan/bootstrap-xui/main/bootstrap-xui.sh?$(date +%s)")
 
 set -euo pipefail
 
-SCRIPT_VERSION="2026.09.10-10"
+SCRIPT_VERSION="2026.09.10-11"
 REPO_RAW="${REPO_RAW:-https://raw.githubusercontent.com/norachchan/bootstrap-xui/main}"
 TEMPLATE_URL="${TEMPLATE_URL:-${REPO_RAW}/template.db}"
 XUI_INSTALL_URL="${XUI_INSTALL_URL:-https://raw.githubusercontent.com/MHSanaei/3x-ui/refs/heads/main/install.sh}"
@@ -248,7 +248,7 @@ ask_inbound_tag() {
 }
 
 run_xui_install() {
-  local tmp logf rc
+  local tmp logf rc spinner_pid
   tmp=$(mktemp /tmp/xui-install.XXXXXX.sh)
   logf=$(mktemp /tmp/xui-install-log.XXXXXX)
   curl -fsSL "$XUI_INSTALL_URL" -o "$tmp"
@@ -262,16 +262,35 @@ run_xui_install() {
   unset XUI_DB_DSN XUI_USERNAME XUI_PASSWORD XUI_PANEL_PORT XUI_WEB_BASE_PATH || true
   unset XUI_DOMAIN XUI_ACME_EMAIL || true
 
-  log "скачивание и установка (тихо)…"
+  # Полный mute: stdout+stderr в файл, stdin закрыт (install иногда пишет в TTY — нет)
+  log "установка в фоне…"
+  (
+    i=0
+    marks='|/-\'
+    while true; do
+      printf '\r  %s%s%s ждём x-ui…' "$DIM" "${marks:$((i % 4)):1}" "$NC" >&2
+      i=$((i + 1))
+      sleep 0.15
+    done
+  ) &
+  spinner_pid=$!
+
   set +e
-  bash "$tmp" >"$logf" 2>&1
+  bash "$tmp" </dev/null >"$logf" 2>&1
   rc=$?
   set -e
+
+  kill "$spinner_pid" 2>/dev/null || true
+  wait "$spinner_pid" 2>/dev/null || true
+  printf '\r\033[K' >&2
+
   rm -f "$tmp"
 
   if [[ $rc -ne 0 ]]; then
-    err "лог установки (хвост):"
-    tail -n 40 "$logf" >&2 || true
+    err "установка упала, хвост лога:"
+    tail -n 50 "$logf" >&2 || true
+    # сохраним лог для разбора
+    cp -f "$logf" /tmp/bootstrap-xui-install.log 2>/dev/null || true
   fi
   rm -f "$logf"
   return "$rc"
