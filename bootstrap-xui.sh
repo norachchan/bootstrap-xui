@@ -4,7 +4,7 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="2026.09.10-12"
+SCRIPT_VERSION="2026.09.10-13"
 REPO_RAW="${REPO_RAW:-https://raw.githubusercontent.com/norachchan/bootstrap-xui/main}"
 TEMPLATE_URL="${TEMPLATE_URL:-${REPO_RAW}/template.db}"
 XUI_INSTALL_URL="${XUI_INSTALL_URL:-https://raw.githubusercontent.com/MHSanaei/3x-ui/refs/heads/main/install.sh}"
@@ -307,9 +307,10 @@ install_3xui() {
   exit 1
 }
 
-# Восстановить/выпустить TLS. При LE rate-limit — взять уже выпущенный cert из acme.sh
+# TLS: LE/acme cache → иначе self-signed (чтобы панель не была plain HTTP)
 ensure_tls_certs() {
   HAS_TLS=0
+  TLS_KIND=""
   CERT_FILE=""
   KEY_FILE=""
 
@@ -319,11 +320,13 @@ ensure_tls_certs() {
     local acme_dir="$1" dest_cert="$2" dest_key="$3"
     local fullchain key
     fullchain=""
+    [[ -d "$acme_dir" ]] || return 1
     for f in fullchain.cer fullchain.pem; do
       [[ -s "${acme_dir}/${f}" ]] && { fullchain="${acme_dir}/${f}"; break; }
     done
+    [[ -n "$fullchain" ]] || fullchain=$(find "$acme_dir" -maxdepth 1 -type f \( -name 'fullchain*' -o -name '*.cer' \) 2>/dev/null | head -1 || true)
     key=$(find "$acme_dir" -maxdepth 1 -type f \( -name '*.key' -o -name 'privkey.pem' \) ! -name '*.csr' 2>/dev/null | head -1 || true)
-    [[ -n "$fullchain" && -n "$key" && -s "$key" ]] || return 1
+    [[ -n "$fullchain" && -s "$fullchain" && -n "$key" && -s "$key" ]] || return 1
     mkdir -p "$(dirname "$dest_cert")"
     cp -f "$fullchain" "$dest_cert"
     cp -f "$key" "$dest_key"
@@ -333,76 +336,99 @@ ensure_tls_certs() {
 
   _acme_install_cert() {
     local domain="$1" dest_cert="$2" dest_key="$3" ecc_flag="${4:-}"
-    local acme=~/.acme.sh/acme.sh
-    [[ -x "$acme" ]] || acme=/root/.acme.sh/acme.sh
+    local acme=/root/.acme.sh/acme.sh
+    [[ -x "$acme" ]] || acme=~/.acme.sh/acme.sh
     [[ -x "$acme" ]] || return 1
     mkdir -p "$(dirname "$dest_cert")"
     # shellcheck disable=SC2086
     "$acme" --install-cert -d "$domain" $ecc_flag \
       --fullchain-file "$dest_cert" \
       --key-file "$dest_key" \
-      --reloadcmd "systemctl restart x-ui 2>/dev/null || true" >/dev/null 2>&1
+      --reloadcmd "true" >/dev/null 2>&1 || true
     _cert_ok "$dest_cert" "$dest_key"
   }
+
+  _make_self_signed() {
+    local dest_cert="$1" dest_key="$2" cn="$3"
+    mkdir -p "$(dirname "$dest_cert")"
+    if [[ "$cn" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+      openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -days 825 -nodes \
+        -keyout "$dest_key" -out "$dest_cert" \
+        -subj "/CN=${cn}" \
+        -addext "subjectAltName=IP:${cn}" >/dev/null 2>&1
+    else
+      openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -days 825 -nodes \
+        -keyout "$dest_key" -out "$dest_cert" \
+        -subj "/CN=${cn}" \
+        -addext "subjectAltName=DNS:${cn}" >/dev/null 2>&1
+    fi
+    chmod 600 "$dest_key" 2>/dev/null || true
+    _cert_ok "$dest_cert" "$dest_key"
+  }
+
+  local ip
+  ip=$(public_ipv4 || true)
+  [[ -n "$ip" ]] || ip=$(hostname -I 2>/dev/null | awk '{print $1}')
 
   if [[ "${SSL_MODE:-}" == "domain" && -n "${SSL_DOMAIN:-}" ]]; then
     CERT_FILE="/root/cert/${SSL_DOMAIN}/fullchain.pem"
     KEY_FILE="/root/cert/${SSL_DOMAIN}/privkey.pem"
     if _cert_ok "$CERT_FILE" "$KEY_FILE"; then
-      HAS_TLS=1
-      ok "SSL: domain cert на месте"
-      return 0
+      HAS_TLS=1; TLS_KIND="existing"; ok "SSL: domain cert на месте"; return 0
     fi
     if _install_from_acme_dir "/root/.acme.sh/${SSL_DOMAIN}_ecc" "$CERT_FILE" "$KEY_FILE" \
       || _install_from_acme_dir "/root/.acme.sh/${SSL_DOMAIN}" "$CERT_FILE" "$KEY_FILE" \
       || _acme_install_cert "$SSL_DOMAIN" "$CERT_FILE" "$KEY_FILE" "--ecc" \
       || _acme_install_cert "$SSL_DOMAIN" "$CERT_FILE" "$KEY_FILE" ""; then
-      HAS_TLS=1
-      ok "SSL: domain cert восстановлен"
+      HAS_TLS=1; TLS_KIND="acme"; ok "SSL: domain cert из acme.sh"; return 0
+    fi
+    if _make_self_signed "$CERT_FILE" "$KEY_FILE" "$SSL_DOMAIN"; then
+      HAS_TLS=1; TLS_KIND="selfsigned"
+      warn "SSL: self-signed для ${SSL_DOMAIN} (LE недоступен)"
       return 0
     fi
-    warn "SSL domain: cert не найден — HTTP"
+    warn "SSL domain: не удалось создать cert"
     return 0
   fi
 
-  # IP mode (default)
+  # IP mode
   CERT_FILE="$CERT_FULLCHAIN"
   KEY_FILE="$CERT_PRIVKEY"
   if _cert_ok "$CERT_FILE" "$KEY_FILE"; then
-    HAS_TLS=1
-    ok "SSL: /root/cert/ip на месте"
-    return 0
+    HAS_TLS=1; TLS_KIND="existing"; ok "SSL: /root/cert/ip на месте"; return 0
   fi
 
-  local ip acme_dir
-  ip=$(public_ipv4 || true)
-  [[ -n "$ip" ]] || ip=$(hostname -I 2>/dev/null | awk '{print $1}')
-
-  # 1) acme.sh --install-cert для IP (если ордер уже есть — без нового выпуска)
   if [[ -n "$ip" ]]; then
     if _acme_install_cert "$ip" "$CERT_FILE" "$KEY_FILE" "--ecc" \
       || _acme_install_cert "$ip" "$CERT_FILE" "$KEY_FILE" ""; then
-      HAS_TLS=1
-      ok "SSL: IP cert через acme.sh --install-cert"
-      return 0
+      HAS_TLS=1; TLS_KIND="acme"; ok "SSL: IP cert через acme.sh"; return 0
+    fi
+    if _install_from_acme_dir "/root/.acme.sh/${ip}_ecc" "$CERT_FILE" "$KEY_FILE" \
+      || _install_from_acme_dir "/root/.acme.sh/${ip}" "$CERT_FILE" "$KEY_FILE"; then
+      HAS_TLS=1; TLS_KIND="acme"; ok "SSL: IP cert из acme cache"; return 0
     fi
   fi
 
-  # 2) копирование из каталога acme.sh
-  for acme_dir in \
-    ${ip:+/root/.acme.sh/${ip}_ecc} \
-    ${ip:+/root/.acme.sh/${ip}} \
-    /root/.acme.sh/*_ecc
-  do
-    [[ -d "$acme_dir" ]] || continue
-    if _install_from_acme_dir "$acme_dir" "$CERT_FILE" "$KEY_FILE"; then
-      HAS_TLS=1
-      ok "SSL: восстановили из ${acme_dir##*/}"
-      return 0
+  # любой fullchain в .acme.sh (на случай другого имени директории)
+  local found_chain found_dir
+  found_chain=$(find /root/.acme.sh -type f \( -name 'fullchain.cer' -o -name 'fullchain.pem' \) 2>/dev/null | head -1 || true)
+  if [[ -n "$found_chain" ]]; then
+    found_dir=$(dirname "$found_chain")
+    if _install_from_acme_dir "$found_dir" "$CERT_FILE" "$KEY_FILE"; then
+      HAS_TLS=1; TLS_KIND="acme"; ok "SSL: взяли ${found_dir##*/}"; return 0
     fi
-  done
+  fi
 
-  warn "SSL: cert нет (LE rate-limit?) — панель на HTTP"
+  # Fallback: self-signed с SAN=IP — убирает warning «plain HTTP» в панели
+  local cn="${ip:-panel.local}"
+  if _make_self_signed "$CERT_FILE" "$KEY_FILE" "$cn"; then
+    HAS_TLS=1
+    TLS_KIND="selfsigned"
+    warn "SSL: self-signed (${cn}) — LE rate-limit/нет cache"
+    return 0
+  fi
+
+  err "SSL: не удалось создать даже self-signed"
   HAS_TLS=0
 }
 
@@ -415,7 +441,11 @@ apply_cert_paths() {
     xui_cli cert -webCert "$CERT_FILE" -webCertKey "$KEY_FILE" >/dev/null 2>&1 || true
     sqlite3 "$XUI_DB_PATH" "UPDATE settings SET value='${CERT_FILE}' WHERE key IN ('webCertFile','subCertFile');"
     sqlite3 "$XUI_DB_PATH" "UPDATE settings SET value='${KEY_FILE}' WHERE key IN ('webKeyFile','subKeyFile');"
-    ok "TLS включён для panel + subscription"
+    if [[ "${TLS_KIND:-}" == "selfsigned" ]]; then
+      ok "TLS: self-signed (HTTPS, браузер может ругаться)"
+    else
+      ok "TLS включён для panel + subscription"
+    fi
   else
     clear_cert_paths_in_db
     warn "TLS не настроен — будет предупреждение HTTP в панели"
@@ -604,7 +634,7 @@ main() {
   INBOUND_TAG=""
   PANEL_USER="" PANEL_PASS="" PANEL_PATH="" PANEL_PORT=""
   ACCESS_URL="" SUBS_URL="" API_TOKEN=""
-  HAS_TLS=0 CERT_FILE="" KEY_FILE=""
+  HAS_TLS=0 TLS_KIND="" CERT_FILE="" KEY_FILE=""
 
   apt_upgrade_noninteractive
   ask_ssl_mode
