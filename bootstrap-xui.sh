@@ -4,7 +4,7 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="2026.09.10-9"
+SCRIPT_VERSION="2026.09.10-10"
 REPO_RAW="${REPO_RAW:-https://raw.githubusercontent.com/norachchan/bootstrap-xui/main}"
 TEMPLATE_URL="${TEMPLATE_URL:-${REPO_RAW}/template.db}"
 XUI_INSTALL_URL="${XUI_INSTALL_URL:-https://raw.githubusercontent.com/MHSanaei/3x-ui/refs/heads/main/install.sh}"
@@ -248,8 +248,9 @@ ask_inbound_tag() {
 }
 
 run_xui_install() {
-  local tmp
+  local tmp logf rc
   tmp=$(mktemp /tmp/xui-install.XXXXXX.sh)
+  logf=$(mktemp /tmp/xui-install-log.XXXXXX)
   curl -fsSL "$XUI_INSTALL_URL" -o "$tmp"
   chmod +x "$tmp"
 
@@ -261,16 +262,18 @@ run_xui_install() {
   unset XUI_DB_DSN XUI_USERNAME XUI_PASSWORD XUI_PANEL_PORT XUI_WEB_BASE_PATH || true
   unset XUI_DOMAIN XUI_ACME_EMAIL || true
 
-  local logf rc
-  logf=$(mktemp /tmp/xui-install-log.XXXXXX)
+  log "скачивание и установка (тихо)…"
   set +e
   bash "$tmp" >"$logf" 2>&1
   rc=$?
   set -e
-  grep -Euv \
-    '^(Hit:|Get:|Ign:|Reading package|Building dependency|Suggested packages|The following|Use '\''apt|0 upgraded|[[:space:]]*% Total|[[:space:]]*[0-9]+[[:space:]]+[0-9]|x-ui/|100[[:space:]]|No checksum|Got x-ui latest|Beginning|Arch:|The OS release|Running\.\.\.|ca-certificates is already|curl is already|tar is already|tzdata is already|socat is already|cron is already|openssl is already|libfwupd|libgusb|Created symlink|Synchronizing state|Executing:|Fail2ban is already|Ip Limit jail|IP Limit installed|Fail2ban setup complete|Setting up Fail2ban|Configuring IP Limit|Found x-ui\.service|Setting up systemd|x-ui control menu|│|└─|┌─|Username:|Password:|Port:|WebBasePath:|Access URL:|Database:|⚠|═)' \
-    "$logf" || true
-  rm -f "$tmp" "$logf"
+  rm -f "$tmp"
+
+  if [[ $rc -ne 0 ]]; then
+    err "лог установки (хвост):"
+    tail -n 40 "$logf" >&2 || true
+  fi
+  rm -f "$logf"
   return "$rc"
 }
 
@@ -521,13 +524,13 @@ print_summary() {
   printf '%s└──────────────────────────────────────────────────────┘%s\n' "$GREEN" "$NC"
   echo ""
   printf '  %s%-12s%s %s%s%s\n' "$DIM" "URL" "$NC" "$GREEN" "$ACCESS_URL" "$NC"
-  if [[ -n "${SUBS_URL:-}" ]]; then
-    printf '  %s%-12s%s %s%s%s\n' "$DIM" "Sub URL" "$NC" "$GREEN" "$SUBS_URL" "$NC"
-  fi
   printf '  %s%-12s%s %s%s%s\n' "$DIM" "Username" "$NC" "$GREEN" "$PANEL_USER" "$NC"
   printf '  %s%-12s%s %s%s%s\n' "$DIM" "Password" "$NC" "$GREEN" "$PANEL_PASS" "$NC"
   if [[ -n "${API_TOKEN:-}" ]]; then
     printf '  %s%-12s%s %s%s%s\n' "$DIM" "API Token" "$NC" "$GREEN" "$API_TOKEN" "$NC"
+  fi
+  if [[ -n "${SUBS_URL:-}" ]]; then
+    printf '  %s%-12s%s %s%s%s\n' "$DIM" "Sub URL" "$NC" "$GREEN" "$SUBS_URL" "$NC"
   fi
   printf '  %s%-12s%s %s%s%s\n' "$DIM" "Inbound" "$NC" "$GREEN" "$INBOUND_TAG" "$NC"
   echo ""
