@@ -4,7 +4,7 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="2026.09.10-7"
+SCRIPT_VERSION="2026.09.10-8"
 REPO_RAW="${REPO_RAW:-https://raw.githubusercontent.com/norachchan/bootstrap-xui/main}"
 TEMPLATE_URL="${TEMPLATE_URL:-${REPO_RAW}/template.db}"
 XUI_INSTALL_URL="${XUI_INSTALL_URL:-https://raw.githubusercontent.com/MHSanaei/3x-ui/refs/heads/main/install.sh}"
@@ -15,30 +15,30 @@ XUI_ENV_FILE="/etc/default/x-ui"
 CERT_FULLCHAIN="/root/cert/ip/fullchain.pem"
 CERT_PRIVKEY="/root/cert/ip/privkey.pem"
 
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-CYAN='\033[0;36m'
-BLUE='\033[0;34m'
-BOLD='\033[1m'
-DIM='\033[2m'
-NC='\033[0m'
+RED=$'\033[0;31m'
+GREEN=$'\033[0;32m'
+YELLOW=$'\033[1;33m'
+CYAN=$'\033[0;36m'
+BLUE=$'\033[0;34m'
+BOLD=$'\033[1m'
+DIM=$'\033[2m'
+NC=$'\033[0m'
 
-log()  { echo -e "  ${CYAN}›${NC} $*"; }
-ok()   { echo -e "  ${GREEN}✓${NC} $*"; }
-warn() { echo -e "  ${YELLOW}!${NC} $*"; }
-err()  { echo -e "  ${RED}✗${NC} $*" >&2; }
+log()  { printf '  %s›%s %s\n' "$CYAN" "$NC" "$*"; }
+ok()   { printf '  %s✓%s %s\n' "$GREEN" "$NC" "$*"; }
+warn() { printf '  %s!%s %s\n' "$YELLOW" "$NC" "$*"; }
+err()  { printf '  %s✗%s %s\n' "$RED" "$NC" "$*" >&2; }
 
 banner() {
   echo ""
-  echo -e "${BLUE}┌──────────────────────────────────────────────────────┐${NC}"
-  printf "${BLUE}│${NC}  ${BOLD}%-50s${NC}${BLUE}│${NC}\n" "$1"
-  echo -e "${BLUE}└──────────────────────────────────────────────────────┘${NC}"
+  printf '%s┌──────────────────────────────────────────────────────┐%s\n' "$BLUE" "$NC"
+  printf '%s│%s  %s%-50s%s%s│%s\n' "$BLUE" "$NC" "$BOLD" "$1" "$NC" "$BLUE" "$NC"
+  printf '%s└──────────────────────────────────────────────────────┘%s\n' "$BLUE" "$NC"
 }
 
 step() {
   echo ""
-  echo -e "${BOLD}$1${NC}  ${DIM}$2${NC}"
+  printf '%s%s%s  %s%s%s\n' "$BOLD" "$1" "$NC" "$DIM" "$2" "$NC"
 }
 
 need_root() {
@@ -502,24 +502,22 @@ EOF
 }
 
 print_summary() {
-  local line
-  line() { printf "  ${DIM}%-12s${NC} %s\n" "$1" "$2"; }
-
   echo ""
-  echo -e "${GREEN}┌──────────────────────────────────────────────────────┐${NC}"
-  echo -e "${GREEN}│${NC}  ${BOLD}Готово — скопируйте сейчас${NC}                          ${GREEN}│${NC}"
-  echo -e "${GREEN}└──────────────────────────────────────────────────────┘${NC}"
+  printf '%s┌──────────────────────────────────────────────────────┐%s\n' "$GREEN" "$NC"
+  printf '%s│%s  %sГотово — скопируйте сейчас%s                          %s│%s\n' \
+    "$GREEN" "$NC" "$BOLD" "$NC" "$GREEN" "$NC"
+  printf '%s└──────────────────────────────────────────────────────┘%s\n' "$GREEN" "$NC"
   echo ""
-  line "URL"      "${GREEN}${ACCESS_URL}${NC}"
-  line "Username" "${GREEN}${PANEL_USER}${NC}"
-  line "Password" "${GREEN}${PANEL_PASS}${NC}"
+  printf '  %s%-12s%s %s%s%s\n' "$DIM" "URL" "$NC" "$GREEN" "$ACCESS_URL" "$NC"
+  printf '  %s%-12s%s %s%s%s\n' "$DIM" "Username" "$NC" "$GREEN" "$PANEL_USER" "$NC"
+  printf '  %s%-12s%s %s%s%s\n' "$DIM" "Password" "$NC" "$GREEN" "$PANEL_PASS" "$NC"
   if [[ -n "${API_TOKEN:-}" ]]; then
-    line "API Token" "${GREEN}${API_TOKEN}${NC}"
+    printf '  %s%-12s%s %s%s%s\n' "$DIM" "API Token" "$NC" "$GREEN" "$API_TOKEN" "$NC"
   fi
-  line "Inbound"  "${GREEN}${INBOUND_TAG}${NC}"
+  printf '  %s%-12s%s %s%s%s\n' "$DIM" "Inbound" "$NC" "$GREEN" "$INBOUND_TAG" "$NC"
   echo ""
-  echo -e "  ${DIM}Bearer: Authorization: Bearer <API Token>${NC}"
-  echo -e "  ${YELLOW}Пароль и token больше не покажутся.${NC}"
+  printf '  %sBearer: Authorization: Bearer <API Token>%s\n' "$DIM" "$NC"
+  printf '  %sПароль и token больше не покажутся.%s\n' "$YELLOW" "$NC"
   echo ""
 }
 
