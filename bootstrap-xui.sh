@@ -4,7 +4,7 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="2026.09.10-8"
+SCRIPT_VERSION="2026.09.10-9"
 REPO_RAW="${REPO_RAW:-https://raw.githubusercontent.com/norachchan/bootstrap-xui/main}"
 TEMPLATE_URL="${TEMPLATE_URL:-${REPO_RAW}/template.db}"
 XUI_INSTALL_URL="${XUI_INSTALL_URL:-https://raw.githubusercontent.com/MHSanaei/3x-ui/refs/heads/main/install.sh}"
@@ -477,6 +477,16 @@ apply_panel_credentials() {
   [[ "${HAS_TLS:-0}" -eq 1 ]] && scheme="https"
   ACCESS_URL="${scheme}://${host}:${PANEL_PORT}/${PANEL_PATH}/"
 
+  # Subscription base URL (без sub_id)
+  local sub_port sub_path
+  sub_port=$(sqlite3 "$XUI_DB_PATH" "SELECT value FROM settings WHERE key='subPort';")
+  sub_path=$(sqlite3 "$XUI_DB_PATH" "SELECT value FROM settings WHERE key='subPath';")
+  [[ -n "$sub_port" ]] || sub_port=2096
+  [[ -n "$sub_path" ]] || sub_path="/subs/"
+  [[ "$sub_path" == /* ]] || sub_path="/${sub_path}"
+  [[ "$sub_path" == */ ]] || sub_path="${sub_path}/"
+  SUBS_URL="${scheme}://${host}:${sub_port}${sub_path}"
+
   install -d -m 700 /etc/x-ui
   umask 077
   cat >/etc/x-ui/install-result.env <<EOF
@@ -485,6 +495,7 @@ XUI_PASSWORD=$(printf '%q' "$PANEL_PASS")
 XUI_PANEL_PORT=$(printf '%q' "$PANEL_PORT")
 XUI_WEB_BASE_PATH=$(printf '%q' "$PANEL_PATH")
 XUI_ACCESS_URL=$(printf '%q' "$ACCESS_URL")
+XUI_SUBS_URL=$(printf '%q' "$SUBS_URL")
 XUI_API_TOKEN=$(printf '%q' "${API_TOKEN:-}")
 XUI_DB_TYPE=sqlite
 XUI_INBOUND_TAG=$(printf '%q' "$INBOUND_TAG")
@@ -493,6 +504,7 @@ EOF
   umask 022
 
   open_firewall_port "$PANEL_PORT"
+  open_firewall_port "$sub_port"
   start_xui
   if verify_panel_up "$PANEL_PORT"; then
     ok "панель на порту ${PANEL_PORT} (${scheme})"
@@ -509,6 +521,9 @@ print_summary() {
   printf '%s└──────────────────────────────────────────────────────┘%s\n' "$GREEN" "$NC"
   echo ""
   printf '  %s%-12s%s %s%s%s\n' "$DIM" "URL" "$NC" "$GREEN" "$ACCESS_URL" "$NC"
+  if [[ -n "${SUBS_URL:-}" ]]; then
+    printf '  %s%-12s%s %s%s%s\n' "$DIM" "Sub URL" "$NC" "$GREEN" "$SUBS_URL" "$NC"
+  fi
   printf '  %s%-12s%s %s%s%s\n' "$DIM" "Username" "$NC" "$GREEN" "$PANEL_USER" "$NC"
   printf '  %s%-12s%s %s%s%s\n' "$DIM" "Password" "$NC" "$GREEN" "$PANEL_PASS" "$NC"
   if [[ -n "${API_TOKEN:-}" ]]; then
@@ -530,7 +545,7 @@ main() {
   SSL_MODE="" SSL_DOMAIN="" SSL_EMAIL=""
   INBOUND_TAG=""
   PANEL_USER="" PANEL_PASS="" PANEL_PATH="" PANEL_PORT=""
-  ACCESS_URL="" API_TOKEN=""
+  ACCESS_URL="" SUBS_URL="" API_TOKEN=""
   HAS_TLS=0 CERT_FILE="" KEY_FILE=""
 
   apt_upgrade_noninteractive
