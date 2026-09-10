@@ -4,7 +4,7 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="2026.09.10-13"
+SCRIPT_VERSION="2026.09.10-14"
 REPO_RAW="${REPO_RAW:-https://raw.githubusercontent.com/norachchan/bootstrap-xui/main}"
 TEMPLATE_URL="${TEMPLATE_URL:-${REPO_RAW}/template.db}"
 XUI_INSTALL_URL="${XUI_INSTALL_URL:-https://raw.githubusercontent.com/MHSanaei/3x-ui/refs/heads/main/install.sh}"
@@ -187,12 +187,44 @@ verify_panel_up() {
 apt_upgrade_noninteractive() {
   step "1/5" "обновление пакетов"
   export DEBIAN_FRONTEND=noninteractive
-  apt-get update -qq
-  apt-get -y -qq \
-    -o Dpkg::Options::="--force-confdef" \
-    -o Dpkg::Options::="--force-confold" \
-    upgrade >/dev/null
-  apt-get install -y -qq curl ca-certificates sqlite3 openssl >/dev/null
+  export NEEDRESTART_MODE=a
+  export NEEDRESTART_SUSPEND=1
+  # needrestart/man-db часто «висят» на Extracting templates — глушим всё
+  local logf rc spinner_pid
+  logf=$(mktemp /tmp/bootstrap-apt.XXXXXX)
+
+  (
+    i=0
+    marks='|/-\'
+    while true; do
+      printf '\r  %s%s%s apt…' "$DIM" "${marks:$((i % 4)):1}" "$NC" >&2
+      i=$((i + 1))
+      sleep 0.2
+    done
+  ) &
+  spinner_pid=$!
+
+  set +e
+  {
+    apt-get update -qq
+    apt-get -y -o Dpkg::Options::="--force-confdef" \
+      -o Dpkg::Options::="--force-confold" \
+      -o Dpkg::Use-Pty=0 \
+      upgrade
+    apt-get install -y -qq curl ca-certificates sqlite3 openssl
+  } </dev/null >"$logf" 2>&1
+  rc=$?
+  set -e
+
+  kill "$spinner_pid" 2>/dev/null || true
+  wait "$spinner_pid" 2>/dev/null || true
+  printf '\r\033[K' >&2
+
+  if [[ $rc -ne 0 ]]; then
+    warn "apt завершился с кодом ${rc} — смотри /tmp/bootstrap-apt.log"
+    cp -f "$logf" /tmp/bootstrap-apt.log 2>/dev/null || true
+  fi
+  rm -f "$logf"
   ok "готово"
 }
 
@@ -227,22 +259,22 @@ ask_ssl_mode() {
   ok "SSL: ${SSL_MODE}${SSL_DOMAIN:+ → ${SSL_DOMAIN}}"
 }
 
-ask_inbound_tag() {
-  local default_tag="$1" tag=""
+ask_inbound_name() {
+  local default_remark="$1" name=""
   echo ""
-  echo -e "  Template tag: ${DIM}${default_tag}${NC}"
+  echo -e "  Сейчас в template: ${DIM}${default_remark}${NC}"
   while true; do
-    read -rp "  Новый inbound tag: " tag || true
-    tag="${tag// /}"
-    if [[ -z "$tag" ]]; then
-      err "пустой tag"
+    read -rp "  Имя inbound (remark/tag): " name || true
+    name="${name// /}"
+    if [[ -z "$name" ]]; then
+      err "пустое имя"
       continue
     fi
-    if [[ ! "$tag" =~ ^[A-Za-z0-9._:-]+$ ]]; then
+    if [[ ! "$name" =~ ^[A-Za-z0-9._:-]+$ ]]; then
       err "только A-Za-z0-9 . _ : -"
       continue
     fi
-    INBOUND_TAG="$tag"
+    INBOUND_TAG="$name"
     break
   done
 }
@@ -476,7 +508,7 @@ restore_template_db() {
   [[ -f "$XUI_DB_PATH" ]] && cp -a "$XUI_DB_PATH" "${XUI_DB_PATH}.bak.$(date +%s)"
   rm -f "${XUI_DB_PATH}-wal" "${XUI_DB_PATH}-shm" 2>/dev/null || true
 
-  local tmp_db old_tag
+  local tmp_db old_tag old_remark
   tmp_db=$(mktemp /tmp/template.XXXXXX.db)
   download_template "$tmp_db"
 
@@ -487,13 +519,15 @@ restore_template_db() {
   fi
 
   old_tag=$(sqlite3 "$tmp_db" "SELECT tag FROM inbounds ORDER BY id LIMIT 1;")
+  old_remark=$(sqlite3 "$tmp_db" "SELECT remark FROM inbounds ORDER BY id LIMIT 1;")
   [[ -n "$old_tag" ]] || { err "в template нет inbound"; rm -f "$tmp_db"; exit 1; }
+  [[ -n "$old_remark" ]] || old_remark="$old_tag"
 
-  ask_inbound_tag "$old_tag"
+  # В панели видно remark («finland»), tag технический (in-443-tcp) — меняем оба
+  ask_inbound_name "$old_remark"
 
-  if [[ "$INBOUND_TAG" != "$old_tag" ]]; then
-    sqlite3 "$tmp_db" "UPDATE inbounds SET tag='${INBOUND_TAG//\'/\'\'}' WHERE tag='${old_tag//\'/\'\'}';"
-  fi
+  sqlite3 "$tmp_db" "UPDATE inbounds SET remark='${INBOUND_TAG//\'/\'\'}', tag='${INBOUND_TAG//\'/\'\'}' WHERE id=(SELECT id FROM inbounds ORDER BY id LIMIT 1);"
+
   sqlite3 "$tmp_db" "DELETE FROM api_tokens;"
   # template указывает на /root/cert/ip — если файлов нет, не оставляем битые пути
   if [[ ! -f "$CERT_FULLCHAIN" || ! -f "$CERT_PRIVKEY" ]]; then
@@ -503,7 +537,7 @@ restore_template_db() {
   install -m 600 "$tmp_db" "$XUI_DB_PATH"
   rm -f "$tmp_db"
   chown root:root "$XUI_DB_PATH" 2>/dev/null || true
-  ok "tag: ${INBOUND_TAG}"
+  ok "inbound: ${INBOUND_TAG}"
 }
 
 create_api_token() {
