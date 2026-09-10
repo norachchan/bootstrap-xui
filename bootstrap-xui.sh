@@ -4,7 +4,7 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="2026.09.10-5"
+SCRIPT_VERSION="2026.09.10-6"
 REPO_RAW="${REPO_RAW:-https://raw.githubusercontent.com/norachchan/bootstrap-xui/main}"
 TEMPLATE_URL="${TEMPLATE_URL:-${REPO_RAW}/template.db}"
 XUI_INSTALL_URL="${XUI_INSTALL_URL:-https://raw.githubusercontent.com/MHSanaei/3x-ui/refs/heads/main/install.sh}"
@@ -59,13 +59,14 @@ gen_alnum() {
 
 port_in_use() {
   local port="$1"
+  # Не парсить колонки ss — на Ubuntu 24 есть Netid, Local Address уже не $4
   if command -v ss >/dev/null 2>&1; then
-    ss -ltn 2>/dev/null | awk -v p=":${port}$" '$4 ~ p {exit 0} END {exit 1}'
-  elif command -v netstat >/dev/null 2>&1; then
-    netstat -lnt 2>/dev/null | awk -v p=":${port} " '$4 ~ p {exit 0} END {exit 1}'
-  else
-    return 1
+    ss -ltn 2>/dev/null | grep -qE ":${port}([[:space:]]|$)" && return 0
   fi
+  if command -v netstat >/dev/null 2>&1; then
+    netstat -lnt 2>/dev/null | grep -qE ":${port}[[:space:]]" && return 0
+  fi
+  return 1
 }
 
 pick_free_panel_port() {
@@ -164,15 +165,20 @@ open_firewall_port() {
 
 verify_panel_up() {
   local port="$1" i
-  for i in $(seq 1 12); do
-    if systemctl is-active --quiet x-ui 2>/dev/null && port_in_use "$port"; then
+  for i in $(seq 1 15); do
+    if port_in_use "$port"; then
+      return 0
+    fi
+    # HTTPS/HTTP на localhost — надёжнее, чем только ss
+    if curl -kfsS --connect-timeout 1 --max-time 2 "https://127.0.0.1:${port}/" -o /dev/null 2>/dev/null \
+      || curl -fsS --connect-timeout 1 --max-time 2 "http://127.0.0.1:${port}/" -o /dev/null 2>/dev/null; then
       return 0
     fi
     sleep 1
   done
   err "панель не слушает порт ${port}"
-  systemctl status x-ui --no-pager -l 2>&1 | tail -20 || true
-  journalctl -u x-ui -n 30 --no-pager 2>&1 || true
+  systemctl status x-ui --no-pager -l 2>&1 | tail -15 || true
+  journalctl -u x-ui -n 20 --no-pager 2>&1 || true
   return 1
 }
 
@@ -242,14 +248,15 @@ ask_inbound_tag() {
 }
 
 run_xui_install() {
-  local db_type="$1" tmp
+  local tmp
   tmp=$(mktemp /tmp/xui-install.XXXXXX.sh)
   curl -fsSL "$XUI_INSTALL_URL" -o "$tmp"
   chmod +x "$tmp"
 
   export DEBIAN_FRONTEND=noninteractive
   export XUI_NONINTERACTIVE=1
-  export XUI_DB_TYPE="$db_type"
+  # Всегда sqlite: template.db — sqlite, postgres без DSN ломает reinstall
+  export XUI_DB_TYPE=sqlite
   export XUI_SSL_MODE="$SSL_MODE"
   unset XUI_DB_DSN XUI_USERNAME XUI_PASSWORD XUI_PANEL_PORT XUI_WEB_BASE_PATH || true
 
@@ -260,26 +267,25 @@ run_xui_install() {
     unset XUI_DOMAIN XUI_ACME_EMAIL || true
   fi
 
+  # Приглушить шум apt/curl progress, оставить суть SSL/ошибок
+  local logf rc
+  logf=$(mktemp /tmp/xui-install-log.XXXXXX)
   set +e
-  bash "$tmp"
-  local rc=$?
+  bash "$tmp" >"$logf" 2>&1
+  rc=$?
   set -e
-  rm -f "$tmp"
+  grep -Euv \
+    '^(Hit:|Get:|Ign:|Reading package|Building dependency|Suggested packages|The following|Use '\''apt|0 upgraded|[[:space:]]*% Total|[[:space:]]*[0-9]+[[:space:]]+[0-9]|x-ui/|100[[:space:]]|No checksum|Got x-ui latest|Beginning|Arch:|The OS release|Running\.\.\.|ca-certificates is already|curl is already|tar is already|tzdata is already|socat is already|cron is already|openssl is already|libfwupd|libgusb|Created symlink|Synchronizing state|Executing:|Fail2ban is already|Ip Limit jail|IP Limit installed|Fail2ban setup complete|Setting up Fail2ban|Configuring IP Limit|Found x-ui\.service|Setting up systemd|x-ui control menu|│|└─|┌─)' \
+    "$logf" || true
+  rm -f "$tmp" "$logf"
   return "$rc"
 }
 
-install_3xui_with_db_fallback() {
+install_3xui() {
   step "3/5" "установка 3x-ui"
-  log "PostgreSQL…"
-  if run_xui_install postgres; then
-    DB_BACKEND="postgres"
-    ok "установлено (postgres)"
-    return 0
-  fi
-  warn "postgres не вышел — SQLite"
-  if run_xui_install sqlite; then
-    DB_BACKEND="sqlite"
-    ok "установлено (sqlite)"
+  force_sqlite_backend
+  if run_xui_install; then
+    ok "установлено"
     return 0
   fi
   err "установка 3x-ui провалилась"
@@ -453,13 +459,13 @@ main() {
   echo -e "  ${DIM}3x-ui + SSL + template inbounds${NC}"
 
   SSL_MODE="" SSL_DOMAIN="" SSL_EMAIL=""
-  INBOUND_TAG="" DB_BACKEND=""
+  INBOUND_TAG=""
   PANEL_USER="" PANEL_PASS="" PANEL_PATH="" PANEL_PORT=""
   ACCESS_URL="" API_TOKEN=""
 
   apt_upgrade_noninteractive
   ask_ssl_mode
-  install_3xui_with_db_fallback
+  install_3xui
   restore_template_db
   apply_panel_credentials
   print_summary
