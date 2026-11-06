@@ -4,7 +4,7 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="2026.09.10-14"
+SCRIPT_VERSION="2026.11.06-15"
 REPO_RAW="${REPO_RAW:-https://raw.githubusercontent.com/norachchan/bootstrap-xui/main}"
 TEMPLATE_URL="${TEMPLATE_URL:-${REPO_RAW}/template.db}"
 XUI_INSTALL_URL="${XUI_INSTALL_URL:-https://raw.githubusercontent.com/MHSanaei/3x-ui/refs/heads/main/install.sh}"
@@ -339,12 +339,77 @@ install_3xui() {
   exit 1
 }
 
-# TLS: LE/acme cache → иначе self-signed (чтобы панель не была plain HTTP)
+# ── TLS / Let's Encrypt ────────────────────────────────────────────────────
+
+acme_bin() {
+  if [[ -x /root/.acme.sh/acme.sh ]]; then
+    echo /root/.acme.sh/acme.sh
+  elif [[ -x "${HOME}/.acme.sh/acme.sh" ]]; then
+    echo "${HOME}/.acme.sh/acme.sh"
+  else
+    return 1
+  fi
+}
+
+ensure_acme_sh() {
+  acme_bin >/dev/null 2>&1 && return 0
+  log "ставим acme.sh…"
+  DEBIAN_FRONTEND=noninteractive apt-get install -y -qq curl socat ca-certificates >/dev/null 2>&1 || true
+  local email="${SSL_EMAIL:-}"
+  [[ -n "$email" ]] || email="admin@$(public_ipv4 2>/dev/null || echo localhost).invalid"
+  # get.acme.sh пишет в ~/.acme.sh; для root это /root/.acme.sh
+  if ! curl -fsSL https://get.acme.sh | sh -s email="$email" >/tmp/bootstrap-acme-install.log 2>&1; then
+    warn "acme.sh install failed — см. /tmp/bootstrap-acme-install.log"
+    return 1
+  fi
+  acme_bin >/dev/null 2>&1
+}
+
+ensure_socat() {
+  command -v socat >/dev/null 2>&1 && return 0
+  DEBIAN_FRONTEND=noninteractive apt-get install -y -qq socat >/dev/null 2>&1 || true
+}
+
+# Освободить :80 для standalone HTTP-01 (nginx/apache часто мешают)
+free_http01_port() {
+  local port="${1:-80}"
+  if ! port_in_use "$port"; then
+    return 0
+  fi
+  warn "порт ${port} занят — останавливаем web-сервисы для ACME"
+  systemctl stop nginx 2>/dev/null || true
+  systemctl stop apache2 2>/dev/null || true
+  systemctl stop httpd 2>/dev/null || true
+  systemctl stop caddy 2>/dev/null || true
+  # x-ui уже stop в apply_panel_credentials, но на всякий
+  systemctl stop x-ui 2>/dev/null || true
+  sleep 1
+  if port_in_use "$port"; then
+    local pids
+    pids=$(ss -ltnp 2>/dev/null | awk -v p=":${port}" '$4 ~ p"$" {print}' | grep -oE 'pid=[0-9]+' | cut -d= -f2 | sort -u || true)
+    if [[ -n "$pids" ]]; then
+      # shellcheck disable=SC2086
+      kill -TERM $pids 2>/dev/null || true
+      sleep 1
+    fi
+  fi
+  ! port_in_use "$port"
+}
+
+open_acme_firewall() {
+  open_firewall_port 80
+  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi 'Status: active'; then
+    ufw allow 80/tcp >/dev/null 2>&1 || true
+  fi
+}
+
+# TLS: existing → acme cache → LE issue (shortlived IP / domain) → self-signed
 ensure_tls_certs() {
   HAS_TLS=0
   TLS_KIND=""
   CERT_FILE=""
   KEY_FILE=""
+  ACME_LAST_LOG=""
 
   _cert_ok() { [[ -f "$1" && -s "$1" && -f "$2" && -s "$2" ]]; }
 
@@ -363,14 +428,14 @@ ensure_tls_certs() {
     cp -f "$fullchain" "$dest_cert"
     cp -f "$key" "$dest_key"
     chmod 600 "$dest_key"
+    chmod 644 "$dest_cert" 2>/dev/null || true
     return 0
   }
 
   _acme_install_cert() {
     local domain="$1" dest_cert="$2" dest_key="$3" ecc_flag="${4:-}"
-    local acme=/root/.acme.sh/acme.sh
-    [[ -x "$acme" ]] || acme=~/.acme.sh/acme.sh
-    [[ -x "$acme" ]] || return 1
+    local acme
+    acme=$(acme_bin) || return 1
     mkdir -p "$(dirname "$dest_cert")"
     # shellcheck disable=SC2086
     "$acme" --install-cert -d "$domain" $ecc_flag \
@@ -398,6 +463,87 @@ ensure_tls_certs() {
     _cert_ok "$dest_cert" "$dest_key"
   }
 
+  # Реальный выпуск LE (раньше bootstrap только искал cache → всегда self-signed)
+  _acme_issue_and_install() {
+    local name="$1" dest_cert="$2" dest_key="$3" mode="$4" # mode: ip|domain
+    local acme webport=80 logf rc
+    ensure_socat
+    ensure_acme_sh || return 1
+    acme=$(acme_bin) || return 1
+    open_acme_firewall
+    if ! free_http01_port "$webport"; then
+      warn "порт ${webport} занят — LE HTTP-01 невозможен"
+      return 1
+    fi
+
+    mkdir -p "$(dirname "$dest_cert")"
+    logf=$(mktemp /tmp/bootstrap-acme-issue.XXXXXX)
+    ACME_LAST_LOG="$logf"
+    log "Let's Encrypt: выпускаем cert для ${name} (${mode})…"
+
+    set +e
+    "$acme" --set-default-ca --server letsencrypt --force >/dev/null 2>&1
+    if [[ "$mode" == "ip" ]]; then
+      # shortlived ≈ 6 дней, как в x-ui → SSL → Get SSL for IP
+      "$acme" --issue -d "$name" \
+        --standalone \
+        --server letsencrypt \
+        --certificate-profile shortlived \
+        --days 6 \
+        --httpport "$webport" \
+        --force >"$logf" 2>&1
+      rc=$?
+    else
+      if [[ -n "${SSL_EMAIL:-}" ]]; then
+        "$acme" --issue -d "$name" -m "$SSL_EMAIL" \
+          --standalone \
+          --server letsencrypt \
+          --httpport "$webport" \
+          --force >"$logf" 2>&1
+        rc=$?
+      else
+        "$acme" --issue -d "$name" \
+          --standalone \
+          --server letsencrypt \
+          --httpport "$webport" \
+          --force >"$logf" 2>&1
+        rc=$?
+      fi
+    fi
+    set -e
+
+    if [[ $rc -ne 0 ]]; then
+      warn "LE issue failed (rc=${rc}) — хвост:"
+      tail -n 20 "$logf" >&2 || true
+      cp -f "$logf" /tmp/bootstrap-acme-issue.log 2>/dev/null || true
+      return 1
+    fi
+
+    # installcert может вернуть non-zero из-за reloadcmd — смотрим файлы
+    "$acme" --install-cert -d "$name" --ecc \
+      --fullchain-file "$dest_cert" \
+      --key-file "$dest_key" \
+      --reloadcmd "true" >/dev/null 2>&1 || true
+    if ! _cert_ok "$dest_cert" "$dest_key"; then
+      "$acme" --install-cert -d "$name" \
+        --fullchain-file "$dest_cert" \
+        --key-file "$dest_key" \
+        --reloadcmd "true" >/dev/null 2>&1 || true
+    fi
+    if ! _cert_ok "$dest_cert" "$dest_key"; then
+      # fallback: скопировать из каталога acme
+      _install_from_acme_dir "/root/.acme.sh/${name}_ecc" "$dest_cert" "$dest_key" \
+        || _install_from_acme_dir "/root/.acme.sh/${name}" "$dest_cert" "$dest_key" \
+        || return 1
+    fi
+
+    chmod 600 "$dest_key" 2>/dev/null || true
+    chmod 644 "$dest_cert" 2>/dev/null || true
+    "$acme" --upgrade --auto-upgrade >/dev/null 2>&1 || true
+    rm -f "$logf"
+    return 0
+  }
+
   local ip
   ip=$(public_ipv4 || true)
   [[ -n "$ip" ]] || ip=$(hostname -I 2>/dev/null | awk '{print $1}')
@@ -412,11 +558,14 @@ ensure_tls_certs() {
       || _install_from_acme_dir "/root/.acme.sh/${SSL_DOMAIN}" "$CERT_FILE" "$KEY_FILE" \
       || _acme_install_cert "$SSL_DOMAIN" "$CERT_FILE" "$KEY_FILE" "--ecc" \
       || _acme_install_cert "$SSL_DOMAIN" "$CERT_FILE" "$KEY_FILE" ""; then
-      HAS_TLS=1; TLS_KIND="acme"; ok "SSL: domain cert из acme.sh"; return 0
+      HAS_TLS=1; TLS_KIND="acme"; ok "SSL: domain cert из acme cache"; return 0
+    fi
+    if _acme_issue_and_install "$SSL_DOMAIN" "$CERT_FILE" "$KEY_FILE" "domain"; then
+      HAS_TLS=1; TLS_KIND="letsencrypt"; ok "SSL: Let's Encrypt domain (${SSL_DOMAIN})"; return 0
     fi
     if _make_self_signed "$CERT_FILE" "$KEY_FILE" "$SSL_DOMAIN"; then
       HAS_TLS=1; TLS_KIND="selfsigned"
-      warn "SSL: self-signed для ${SSL_DOMAIN} (LE недоступен)"
+      warn "SSL: self-signed для ${SSL_DOMAIN} (LE не выпустился, лог /tmp/bootstrap-acme-issue.log)"
       return 0
     fi
     warn "SSL domain: не удалось создать cert"
@@ -432,12 +581,13 @@ ensure_tls_certs() {
 
   if [[ -n "$ip" ]]; then
     if _acme_install_cert "$ip" "$CERT_FILE" "$KEY_FILE" "--ecc" \
-      || _acme_install_cert "$ip" "$CERT_FILE" "$KEY_FILE" ""; then
-      HAS_TLS=1; TLS_KIND="acme"; ok "SSL: IP cert через acme.sh"; return 0
-    fi
-    if _install_from_acme_dir "/root/.acme.sh/${ip}_ecc" "$CERT_FILE" "$KEY_FILE" \
+      || _acme_install_cert "$ip" "$CERT_FILE" "$KEY_FILE" "" \
+      || _install_from_acme_dir "/root/.acme.sh/${ip}_ecc" "$CERT_FILE" "$KEY_FILE" \
       || _install_from_acme_dir "/root/.acme.sh/${ip}" "$CERT_FILE" "$KEY_FILE"; then
       HAS_TLS=1; TLS_KIND="acme"; ok "SSL: IP cert из acme cache"; return 0
+    fi
+    if _acme_issue_and_install "$ip" "$CERT_FILE" "$KEY_FILE" "ip"; then
+      HAS_TLS=1; TLS_KIND="letsencrypt"; ok "SSL: Let's Encrypt IP (${ip}, ~6 дней)"; return 0
     fi
   fi
 
@@ -456,7 +606,7 @@ ensure_tls_certs() {
   if _make_self_signed "$CERT_FILE" "$KEY_FILE" "$cn"; then
     HAS_TLS=1
     TLS_KIND="selfsigned"
-    warn "SSL: self-signed (${cn}) — LE rate-limit/нет cache"
+    warn "SSL: self-signed (${cn}) — LE не выпустился (открой :80, см. /tmp/bootstrap-acme-issue.log)"
     return 0
   fi
 
@@ -473,11 +623,11 @@ apply_cert_paths() {
     xui_cli cert -webCert "$CERT_FILE" -webCertKey "$KEY_FILE" >/dev/null 2>&1 || true
     sqlite3 "$XUI_DB_PATH" "UPDATE settings SET value='${CERT_FILE}' WHERE key IN ('webCertFile','subCertFile');"
     sqlite3 "$XUI_DB_PATH" "UPDATE settings SET value='${KEY_FILE}' WHERE key IN ('webKeyFile','subKeyFile');"
-    if [[ "${TLS_KIND:-}" == "selfsigned" ]]; then
-      ok "TLS: self-signed (HTTPS, браузер может ругаться)"
-    else
-      ok "TLS включён для panel + subscription"
-    fi
+    case "${TLS_KIND:-}" in
+      selfsigned) ok "TLS: self-signed (HTTPS, браузер может ругаться)" ;;
+      letsencrypt|acme|existing) ok "TLS: Let's Encrypt / acme для panel + subscription" ;;
+      *) ok "TLS включён для panel + subscription" ;;
+    esac
   else
     clear_cert_paths_in_db
     warn "TLS не настроен — будет предупреждение HTTP в панели"
