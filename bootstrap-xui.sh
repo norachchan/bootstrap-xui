@@ -4,7 +4,7 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="2026.11.06-16"
+SCRIPT_VERSION="2026.11.06-17"
 REPO_RAW="${REPO_RAW:-https://raw.githubusercontent.com/norachchan/bootstrap-xui/main}"
 TEMPLATE_URL="${TEMPLATE_URL:-${REPO_RAW}/template.db}"
 XUI_INSTALL_URL="${XUI_INSTALL_URL:-https://raw.githubusercontent.com/MHSanaei/3x-ui/refs/heads/main/install.sh}"
@@ -380,11 +380,19 @@ ensure_acme_sh() {
   log "ставим acme.sh…"
   DEBIAN_FRONTEND=noninteractive apt-get install -y -qq curl socat ca-certificates >/dev/null 2>&1 || true
   local email="${SSL_EMAIL:-}"
-  [[ -n "$email" ]] || email="admin@$(public_ipv4 2>/dev/null || echo localhost).invalid"
+  # LE отклоняет *.invalid / не-публичные TLD — для IP-режима без email не передаём -s email=
   # get.acme.sh пишет в ~/.acme.sh; для root это /root/.acme.sh
-  if ! curl -fsSL https://get.acme.sh | sh -s email="$email" >/tmp/bootstrap-acme-install.log 2>&1; then
-    warn "acme.sh install failed — см. /tmp/bootstrap-acme-install.log"
-    return 1
+  local install_log=/tmp/bootstrap-acme-install.log
+  if [[ -n "$email" ]]; then
+    if ! curl -fsSL https://get.acme.sh | sh -s email="$email" >"$install_log" 2>&1; then
+      warn "acme.sh install failed — см. $install_log"
+      return 1
+    fi
+  else
+    if ! curl -fsSL https://get.acme.sh | sh >"$install_log" 2>&1; then
+      warn "acme.sh install failed — см. $install_log"
+      return 1
+    fi
   fi
   acme_bin >/dev/null 2>&1
 }
@@ -838,8 +846,14 @@ main() {
   banner "bootstrap-xui  ${SCRIPT_VERSION}"
   echo -e "  ${DIM}3x-ui + SSL + template inbounds${NC}"
 
-  SSL_MODE="" SSL_DOMAIN="" SSL_EMAIL=""
-  INBOUND_TAG=""
+  # Сохраняем заранее заданные env (INBOUND_TAG=netherlands SSL_MODE=domain …)
+  local preset_ssl_mode="${SSL_MODE:-}"
+  local preset_ssl_domain="${SSL_DOMAIN:-}"
+  local preset_ssl_email="${SSL_EMAIL:-}"
+  local preset_inbound="${INBOUND_TAG:-}"
+
+  SSL_MODE="$preset_ssl_mode" SSL_DOMAIN="$preset_ssl_domain" SSL_EMAIL="$preset_ssl_email"
+  INBOUND_TAG="$preset_inbound"
   PANEL_USER="" PANEL_PASS="" PANEL_PATH="" PANEL_PORT=""
   ACCESS_URL="" SUBS_URL="" API_TOKEN=""
   HAS_TLS=0 TLS_KIND="" CERT_FILE="" KEY_FILE=""
