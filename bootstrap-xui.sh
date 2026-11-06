@@ -4,7 +4,7 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="2026.11.06-15"
+SCRIPT_VERSION="2026.11.06-16"
 REPO_RAW="${REPO_RAW:-https://raw.githubusercontent.com/norachchan/bootstrap-xui/main}"
 TEMPLATE_URL="${TEMPLATE_URL:-${REPO_RAW}/template.db}"
 XUI_INSTALL_URL="${XUI_INSTALL_URL:-https://raw.githubusercontent.com/MHSanaei/3x-ui/refs/heads/main/install.sh}"
@@ -228,53 +228,77 @@ apt_upgrade_noninteractive() {
   ok "готово"
 }
 
+# Тег inbound: только a-z (netherlands), без цифр/регистра/символов.
+normalize_inbound_tag() {
+  local raw="${1:-}"
+  # shellcheck disable=SC2001
+  printf '%s' "$raw" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z]//g'
+}
+
 ask_ssl_mode() {
   step "2/5" "SSL"
-  echo ""
-  echo -e "  ${BOLD}1${NC}  Domain  ${DIM}(Let's Encrypt, 90 дней)${NC}"
-  echo -e "  ${BOLD}2${NC}  IP      ${DIM}(Let's Encrypt, ~6 дней, по умолчанию)${NC}"
-  echo ""
-  local choice=""
-  read -rp "  Выбор [2]: " choice || true
-  choice="${choice// /}"
-  case "$choice" in
-    1) SSL_MODE="domain" ;;
-    ""|2) SSL_MODE="ip" ;;
-    *)
-      warn "неизвестно — IP"
-      SSL_MODE="ip"
-      ;;
-  esac
+  SSL_DOMAIN="${SSL_DOMAIN:-}"
+  SSL_EMAIL="${SSL_EMAIL:-}"
 
-  SSL_DOMAIN=""
-  SSL_EMAIL=""
-  if [[ "$SSL_MODE" == "domain" ]]; then
-    while [[ -z "$SSL_DOMAIN" ]]; do
-      read -rp "  Domain: " SSL_DOMAIN || true
-      SSL_DOMAIN="${SSL_DOMAIN// /}"
-    done
-    read -rp "  Email (Enter — пропуск): " SSL_EMAIL || true
-    SSL_EMAIL="${SSL_EMAIL// /}"
+  # По умолчанию IP. Domain только если заранее: SSL_MODE=domain SSL_DOMAIN=example.com
+  if [[ "${SSL_MODE:-}" == "domain" ]]; then
+    if [[ -z "$SSL_DOMAIN" ]]; then
+      while [[ -z "$SSL_DOMAIN" ]]; do
+        read -rp "  Domain: " SSL_DOMAIN || true
+        SSL_DOMAIN="${SSL_DOMAIN// /}"
+      done
+      read -rp "  Email (Enter — пропуск): " SSL_EMAIL || true
+      SSL_EMAIL="${SSL_EMAIL// /}"
+    fi
+    ok "SSL: domain → ${SSL_DOMAIN}"
+    return 0
   fi
-  ok "SSL: ${SSL_MODE}${SSL_DOMAIN:+ → ${SSL_DOMAIN}}"
+
+  SSL_MODE="ip"
+  ok "SSL: ip (Let's Encrypt shortlived, по умолчанию)"
 }
 
 ask_inbound_name() {
-  local default_remark="$1" name=""
+  local default_remark="$1" name="" normalized=""
   echo ""
   echo -e "  Сейчас в template: ${DIM}${default_remark}${NC}"
+  echo -e "  ${DIM}тег → только a-z, без цифр (пример: netherlands)${NC}"
+
+  # Неинтерактивно: INBOUND_TAG=netherlands bash bootstrap-xui.sh
+  if [[ -n "${INBOUND_TAG:-}" ]]; then
+    normalized=$(normalize_inbound_tag "$INBOUND_TAG")
+    if [[ -z "$normalized" ]]; then
+      err "INBOUND_TAG='${INBOUND_TAG}' после нормализации пуст"
+      exit 1
+    fi
+    INBOUND_TAG="$normalized"
+    ok "inbound tag: ${INBOUND_TAG} (из env)"
+    return 0
+  fi
+
   while true; do
     read -rp "  Имя inbound (remark/tag): " name || true
     name="${name// /}"
     if [[ -z "$name" ]]; then
+      # fallback из remark template, тоже нормализуем
+      normalized=$(normalize_inbound_tag "$default_remark")
+      if [[ -n "$normalized" ]]; then
+        INBOUND_TAG="$normalized"
+        ok "inbound tag: ${INBOUND_TAG} (из template)"
+        break
+      fi
       err "пустое имя"
       continue
     fi
-    if [[ ! "$name" =~ ^[A-Za-z0-9._:-]+$ ]]; then
-      err "только A-Za-z0-9 . _ : -"
+    normalized=$(normalize_inbound_tag "$name")
+    if [[ -z "$normalized" ]]; then
+      err "после нормализации пусто — нужны латинские буквы (netherlands)"
       continue
     fi
-    INBOUND_TAG="$name"
+    if [[ "$normalized" != "$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]')" ]]; then
+      warn "нормализовано: ${name} → ${normalized}"
+    fi
+    INBOUND_TAG="$normalized"
     break
   done
 }
